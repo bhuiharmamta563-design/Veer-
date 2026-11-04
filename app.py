@@ -1,4 +1,6 @@
-from datetime import datetime
+from datetime import datetime, timedelta
+from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +78,123 @@ def parse_chain(js):
     return dict(df=df, expiries=exps, underlying=rec.get("underlyingValue"))
 
 
+
+# ---------------- Upstox helpers (Analytics Token, read-only) ----------------
+UP_BASE = "https://api.upstox.com"
+UP_KEYS = {"NIFTY 50": "NSE_INDEX|Nifty 50", "BANKNIFTY": "NSE_INDEX|Nifty Bank"}
+UP_IV = {"1m": ("minutes", 1), "5m": ("minutes", 5), "15m": ("minutes", 15),
+         "30m": ("minutes", 30), "1h": ("hours", 1), "1d": ("days", 1)}
+UP_DAYS = {"1m": 5, "5m": 30, "15m": 30, "30m": 60, "1h": 90, "1d": 730}
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def up_token():
+    tok = str(st.session_state.get("up_token_in", "")).strip()
+    if tok:
+        return tok
+    try:
+        return str(st.secrets.get("UPSTOX_TOKEN", "")).strip()
+    except Exception:
+        return ""
+
+
+def up_get(path, token, params=None):
+    url = UP_BASE + path
+    if params:
+        url += "?" + urlencode(params, quote_via=quote)
+    r = requests.get(url, timeout=15,
+                     headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
+    if r.status_code == 401:
+        raise RuntimeError("Upstox token galat ya expire hai (401).")
+    if r.status_code != 200:
+        raise RuntimeError(f"Upstox error {r.status_code}: {r.text[:150]}")
+    js = r.json()
+    if js.get("status") != "success":
+        raise RuntimeError(f"Upstox ne success nahi diya: {str(js)[:150]}")
+    return js.get("data")
+
+
+def _candles_df(rows):
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    d = pd.DataFrame([r[:6] for r in rows], columns=["ts"] + cols)
+    d["ts"] = pd.to_datetime(d["ts"], utc=True).dt.tz_convert(IST)
+    return d.set_index("ts")
+
+
+def up_candles(ikey, interval, token):
+    unit, n = UP_IV[interval]
+    k = quote(ikey, safe="")
+    today = datetime.now(IST).date()
+    frm = today - timedelta(days=UP_DAYS[interval])
+    hist = up_get(f"/v3/historical-candle/{k}/{unit}/{n}/{today:%Y-%m-%d}/{frm:%Y-%m-%d}", token)
+    parts = [_candles_df((hist or {}).get("candles", []))]
+    try:   # aaj ki candles alag endpoint se
+        intra = up_get(f"/v3/historical-candle/intraday/{k}/{unit}/{n}", token)
+        parts.append(_candles_df((intra or {}).get("candles", [])))
+    except RuntimeError:
+        pass
+    d = pd.concat(parts)
+    d = d[~d.index.duplicated(keep="last")].sort_index()
+    return d.dropna()
+
+
+def _exp_str(v):
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v / 1000, IST).strftime("%Y-%m-%d")
+    return str(v)[:10]
+
+
+def up_expiries(ikey, token):
+    data = up_get("/v2/option/contract", token, {"instrument_key": ikey}) or []
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    return sorted({e for e in (_exp_str(c.get("expiry")) for c in data if c.get("expiry")) if e >= today})
+
+
+def up_chain_rows(ikey, expiry, token):
+    data = up_get("/v2/option/chain", token, {"instrument_key": ikey, "expiry_date": expiry}) or []
+    rows, spot = [], None
+    for it in data:
+        co = (it.get("call_options") or {}).get("market_data") or {}
+        po = (it.get("put_options") or {}).get("market_data") or {}
+        g = lambda m, k: m.get(k) or 0
+        rows.append(dict(
+            Expiry=expiry, Strike=it.get("strike_price"),
+            CE_OI=g(co, "oi"), CE_ChgOI=g(co, "oi") - g(co, "prev_oi"),
+            CE_Vol=g(co, "volume"), CE_LTP=g(co, "ltp"),
+            PE_OI=g(po, "oi"), PE_ChgOI=g(po, "oi") - g(po, "prev_oi"),
+            PE_Vol=g(po, "volume"), PE_LTP=g(po, "ltp")))
+        spot = it.get("underlying_spot_price") or spot
+    return pd.DataFrame(rows), spot
+
+
+def on_fetch_upstox():
+    tok, p = up_token(), st.session_state.get("preset", "NIFTY 50")
+    if not tok:
+        st.session_state["nse_msg"] = ("error", "Upstox token nahi mila. Sidebar mein token daalo.")
+        return
+    if p not in UP_KEYS:
+        st.session_state["nse_msg"] = ("error", "Upstox option chain abhi sirf NIFTY/BANKNIFTY ke liye hai. Stock ke liye Free source chuno.")
+        return
+    try:
+        ik = UP_KEYS[p]
+        exps = up_expiries(ik, tok)
+        if not exps:
+            raise RuntimeError("Expiry list khali aayi.")
+        df, spot = up_chain_rows(ik, exps[0], tok)
+        if df.empty:
+            raise RuntimeError("Option chain khali aayi.")
+    except Exception as e:
+        st.session_state["nse_msg"] = ("error", str(e))
+        return
+    st.session_state["chain"] = dict(df=df, expiries=exps, underlying=spot, symbol=p,
+                                     source="Upstox", ikey=ik)
+    st.session_state["exp_sel"] = exps[0]
+    apply_levels()
+    st.session_state["nse_msg"] = ("success", f"Upstox data mil gaya · Spot {spot}")
+
+
 def apply_levels():
     """Selected expiry + basis se CIP/PIP nikal ke inputs me daalta hai (callback)."""
     ch = st.session_state.get("chain")
@@ -84,8 +203,18 @@ def apply_levels():
     exp = st.session_state.get("exp_sel")
     if exp not in ch["expiries"]:
         exp = st.session_state["exp_sel"] = ch["expiries"][0]
+    if ch.get("source") == "Upstox" and exp not in set(ch["df"]["Expiry"]):
+        try:
+            nd, _ = up_chain_rows(ch["ikey"], exp, up_token())
+            ch["df"] = pd.concat([ch["df"], nd], ignore_index=True)
+        except Exception as e:
+            st.session_state["nse_msg"] = ("error", str(e))
+            return
     m = BASIS[st.session_state.get("basis", "Max OI")]
     d = ch["df"][ch["df"]["Expiry"] == exp]
+    if d.empty:
+        st.session_state["nse_msg"] = ("error", "Is expiry ka data khali hai.")
+        return
     c, p = d.loc[d[f"CE_{m}"].idxmax()], d.loc[d[f"PE_{m}"].idxmax()]
     pr = st.session_state.get("preset", "NIFTY 50")
     st.session_state[f"cip_{pr}"] = float(c["Strike"])
@@ -96,6 +225,8 @@ def apply_levels():
 
 
 def on_fetch():
+    if st.session_state.get("src") == "Upstox":
+        return on_fetch_upstox()
     sym, stock = nse_symbol()
     if not sym:
         st.session_state["nse_msg"] = ("error", "Pehle stock ka NSE symbol likho.")
@@ -121,8 +252,22 @@ with st.sidebar:
         custom = st.text_input("NSE symbol (e.g. RELIANCE)", "RELIANCE", key="custom_sym").strip().upper()
     stock_mode = preset == "Custom (stock)"
 
+    st.subheader("Data source")
+    src = st.radio("Chart + option chain", ["Upstox", "Free (yfinance/NSE)"],
+                   index=0 if up_token() else 1, key="src", horizontal=True)
+    if src == "Upstox":
+        if not up_token():
+            st.text_input("Upstox Analytics Token", type="password", key="up_token_in",
+                          help="Upstox Developer Apps -> Analytics tab -> Generate Token")
+        else:
+            st.caption("✅ Upstox token mil gaya")
+            with st.expander("Token badlo"):
+                st.text_input("Naya token", type="password", key="up_token_in")
+        if stock_mode:
+            st.caption("⚠️ Stock ke liye Upstox abhi on nahi hai, Free source use hoga.")
+
     st.subheader("Option chain levels")
-    st.button("📡 NSE se CIP/PIP lao", on_click=on_fetch, type="primary", width="stretch")
+    st.button(f"📡 {'Upstox' if src == 'Upstox' else 'NSE'} se CIP/PIP lao", on_click=on_fetch, type="primary", width="stretch")
     st.selectbox("CIP/PIP kis basis par", list(BASIS), key="basis", on_change=apply_levels)
     if st.session_state.get("chain"):
         st.selectbox("Expiry", st.session_state["chain"]["expiries"], key="exp_sel", on_change=apply_levels)
@@ -236,11 +381,17 @@ period = {"1m": "5d", "5m": "30d", "15m": "30d", "30m": "60d", "1h": "180d", "1d
 
 
 @st.cache_data(ttl=60, show_spinner="Data aa raha hai...")
-def load(tkr, period, interval):
+def load(tkr, period, interval, src="Free", ikey="", _token=""):
+    note = ""
+    if src == "Upstox" and ikey and _token:
+        try:
+            return up_candles(ikey, interval, _token), "Upstox", ""
+        except Exception as e:
+            note = f"Upstox candles nahi aaye ({e}). yfinance use ho raha hai."
     df = yf.download(tkr, period=period, interval=interval, progress=False, auto_adjust=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    return df.dropna()
+    return df.dropna(), "yfinance", note
 
 
 def heikin_ashi(d):
@@ -373,7 +524,9 @@ def build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p):
 if refresh:
     st.cache_data.clear()
 
-full = load(ticker, period, interval)
+full, used, note = load(ticker, period, interval, src, UP_KEYS.get(preset, ""), up_token())
+if note:
+    st.warning(note)
 if full.empty:
     st.error(f"'{ticker}' ka data nahi mila. Symbol ya timeframe check karo.")
     st.stop()
@@ -386,7 +539,7 @@ if pip >= cip:
 ltp = float(df["Close"].iloc[-1])
 chg = ltp - float(full["Close"].iloc[-2]) if len(full) > 1 else 0.0
 h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
-h1.subheader(f"{ticker}  ·  {interval}")
+h1.subheader(f"{ticker}  ·  {interval}  ·  {used}")
 h2.metric("LTP", f"{ltp:,.2f}", f"{chg:+,.2f}")
 h3.metric("To CIP", f"{cip - ltp:,.1f}")
 h4.metric("To PIP", f"{ltp - pip:,.1f}")
