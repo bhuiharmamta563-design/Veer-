@@ -1,194 +1,227 @@
-"""
-Liquidity Scanner - Streamlit app
-Run:  streamlit run app.py
-"""
-import time
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import requests
 import streamlit as st
+import pandas as pd
+import requests
+import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Liquidity Scanner", layout="wide")
+# Page setup
+st.set_page_config(layout="wide", page_title="Ultimate AI Option Chain & Reversal Terminal")
 
+# Auto refresh every 5 seconds
+st_autorefresh(interval=5000, limit=100, key="upstox_chain_refresh")
 
-# ---------------------------------------------------------------- scanner logic
-def swing_points(df, left=3, right=3):
-    highs, lows = df["high"].values, df["low"].values
-    n = len(df)
-    sh, sl = np.zeros(n, bool), np.zeros(n, bool)
-    for i in range(left, n - right):
-        if highs[i] == highs[i - left : i + right + 1].max():
-            sh[i] = True
-        if lows[i] == lows[i - left : i + right + 1].min():
-            sl[i] = True
-    out = df.copy()
-    out["swing_high"], out["swing_low"] = sh, sl
-    return out
+st.title("🚀 Ultimate Upstox Option Chain Terminal with Reversal & AI Insights")
 
+# Upstox API Settings
+ACCESS_TOKEN = st.secrets.get("UPSTOX_ACCESS_TOKEN", "YOUR_UPSTOX_ACCESS_TOKEN")
 
-def _cluster(levels, tol_pct):
-    levels = sorted(levels)
-    clusters, cur = [], []
-    for lv in levels:
-        if cur and (lv - np.mean(cur)) / np.mean(cur) * 100 > tol_pct:
-            clusters.append(cur)
-            cur = []
-        cur.append(lv)
-    if cur:
-        clusters.append(cur)
-    return [c for c in clusters if len(c) >= 2]
+# Multi-Symbol Switcher
+symbol_choice = st.selectbox("Index Select Karein:", ["Nifty 50", "Bank Nifty", "Fin Nifty"])
+instrument_mapping = {
+    "Nifty 50": "NSE_INDEX|Nifty 50",
+    "Bank Nifty": "NSE_INDEX|Nifty Bank",
+    "Fin Nifty": "NSE_INDEX|Nifty Fin Service"
+}
+INSTRUMENT_KEY = instrument_mapping[symbol_choice]
 
+# Expiry Selector Dropdown
+expiry_choice = st.selectbox("Expiry Date Select Karein:", ["2026-11-12", "2026-11-19", "2026-11-26"])
+EXPIRY_DATE = expiry_choice
 
-def liquidity_zones(df, tol_pct=0.1):
-    sw = swing_points(df)
-    eqh = _cluster(sw.loc[sw.swing_high, "high"].tolist(), tol_pct)
-    eql = _cluster(sw.loc[sw.swing_low, "low"].tolist(), tol_pct)
-    return (
-        [{"level": round(float(np.mean(c)), 2), "touches": len(c)} for c in eqh],
-        [{"level": round(float(np.mean(c)), 2), "touches": len(c)} for c in eql],
+headers = {
+    'Accept': 'application/json',
+    'Authorization': f'Bearer {ACCESS_TOKEN}'
+}
+
+@st.cache_data(ttl=3)
+def fetch_option_chain(inst_key, exp_date):
+    url = "https://api.upstox.com/v2/option/chain"
+    params = {'instrument_key': inst_key, 'expiry_date': exp_date}
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        if response.status_code == 200:
+            return response.json().get('data', [])
+        else:
+            return []
+    except:
+        return []
+
+raw_data = fetch_option_chain(INSTRUMENT_KEY, EXPIRY_DATE)
+
+if raw_data:
+    table_rows = []
+    underlying_price = raw_data[0].get('underlying_spot_price', 22800)
+
+    total_call_oi = 0
+    total_put_oi = 0
+
+    for item in raw_data:
+        strike = item.get('strike_price')
+        c_data = item.get('call_options', {}).get('market_data', {})
+        p_data = item.get('put_options', {}).get('market_data', {})
+
+        c_oi = c_data.get('oi', 0)
+        p_oi = p_data.get('oi', 0)
+        total_call_oi += c_oi
+        total_put_oi += p_oi
+
+        table_rows.append({
+            "C_Vol": c_data.get('volume', 0),
+            "C_OI_Chg%": c_data.get('oi_change_percentage', 0),
+            "C_OI": c_oi,
+            "C_IV": c_data.get('iv', 0),
+            "C_LTP": c_data.get('ltp', 0),
+            "Strike": strike,
+            "P_LTP": p_data.get('ltp', 0),
+            "P_IV": p_data.get('iv', 0),
+            "P_OI": p_oi,
+            "P_OI_Chg%": p_data.get('oi_change_percentage', 0),
+            "P_Vol": p_data.get('volume', 0),
+        })
+
+    df = pd.DataFrame(table_rows)
+    df = df.sort_values(by="Strike").reset_index(drop=True)
+
+    # Calculations
+    pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else 0
+    atm_row = df.iloc[(df['Strike'] - underlying_price).abs().argsort()[:1]]
+    atm_call_ltp = atm_row['C_LTP'].values[0] if not atm_row.empty else 0
+    atm_put_ltp = atm_row['P_LTP'].values[0] if not atm_row.empty else 0
+    straddle_price = round(atm_call_ltp + atm_put_ltp, 2)
+
+    oi_supply_zones = df.nlargest(2, 'C_OI')['Strike'].tolist()
+    oi_demand_zones = df.nlargest(2, 'P_OI')['Strike'].tolist()
+    vol_supply_zones = df.nlargest(2, 'C_Vol')['Strike'].tolist()
+    vol_demand_zones = df.nlargest(2, 'P_Vol')['Strike'].tolist()
+
+    # ----------------------------------------------------
+    # Reversal Price Calculation Logic
+    # ----------------------------------------------------
+    # Spot price ke sabse paas wala equilibrium point ya high volume crossover reversal zone determine karta hai
+    closest_strike_idx = (df['Strike'] - underlying_price).abs().argsort()[:1]
+    atm_strike = df.iloc[closest_strike_idx]['Strike'].values[0] if not df.empty else underlying_price
+    
+    # Estimated reversal trigger based on Max Volume and OI shift near ATM
+    reversal_price = int(df.loc[(df['P_OI'] - df['C_OI']).abs().idxmin()]['Strike']) if not df.empty else atm_strike
+
+    # ----------------------------------------------------
+    # AI Market Analyst & Reversal Insights
+    # ----------------------------------------------------
+    def generate_ai_insights(pcr, spot, sup, res, rev):
+        insights = []
+        sentiment = "Neutral"
+        
+        if pcr > 1.2:
+            sentiment = "Bullish 🟢"
+            insights.append(f"PCR is high at **{pcr}**, showing solid Put writing and strong demand base.")
+        elif pcr < 0.8:
+            sentiment = "Bearish 🔴"
+            insights.append(f"PCR is low at **{pcr}**, indicating dominant Call writing and overhead supply.")
+        else:
+            sentiment = "Sideways / Rangebound ⚪"
+            insights.append(f"PCR is balanced at **{pcr}**, pointing to range-bound movement.")
+
+        insights.append(f"Estimated **Reversal Trigger Level** is calculated around **{rev}**. Watch for price action near this strike for potential trend reversals.")
+        insights.append(f"Immediate Support is near **{sup[0]}** and Resistance near **{res[0]}**.")
+        
+        return sentiment, insights
+
+    ai_sentiment, ai_bullets = generate_ai_insights(pcr, underlying_price, oi_demand_zones, oi_supply_zones, reversal_price)
+
+    # Top Metrics Cards (Spot, PCR, Straddle, Reversal)
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Spot Price", f"{underlying_price}")
+    col2.metric("PCR Sentiment", f"{pcr} ({ai_sentiment.split()[0]})")
+    col3.metric("ATM Straddle", f"₹{straddle_price}")
+    col4.metric("Reversal Level", f"{reversal_price}")
+    col5.metric("Expiry", EXPIRY_DATE)
+
+    # AI Insight Box UI Display
+    with st.expander("🤖 **AI Option Chain Smart Summary & Reversal Analysis**", expanded=True):
+        st.markdown(f"### Market Bias: **{ai_sentiment}**")
+        for bullet in ai_bullets:
+            st.markdown(f"- {bullet}")
+
+    st.info(f"🛡️ **OI Support:** `{oi_demand_zones}` | ⚠️ **OI Resistance:** `{oi_supply_zones}` | 🔄 **Reversal Zone:** `{reversal_price}`")
+
+    # View Mode Selector
+    view_mode = st.radio(
+        "View Mode Select Karein:", 
+        ["📋 Option Chain Table", "📊 OI Chart with Zones", "📉 Volume Chart with Zones"], 
+        horizontal=True
     )
 
-
-def detect_sweeps(df, lookback=20):
-    rows = []
-    for i in range(lookback, len(df)):
-        prev = df.iloc[i - lookback : i]
-        c = df.iloc[i]
-        ph, pl = prev["high"].max(), prev["low"].min()
-        if c["high"] > ph and c["close"] < ph:
-            rows.append({"time": c["time"], "type": "BEARISH_SWEEP", "level": ph, "price": c["high"]})
-        elif c["low"] < pl and c["close"] > pl:
-            rows.append({"time": c["time"], "type": "BULLISH_SWEEP", "level": pl, "price": c["low"]})
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------- data loaders
-def demo_data(n=300):
-    rng = np.random.default_rng(7)
-    close = 100 + np.cumsum(rng.normal(0, 0.4, n))
-    return pd.DataFrame({
-        "time": pd.date_range("2026-01-01", periods=n, freq="15min"),
-        "open": close + rng.normal(0, 0.1, n),
-        "high": close + abs(rng.normal(0.3, 0.2, n)),
-        "low": close - abs(rng.normal(0.3, 0.2, n)),
-        "close": close,
-        "volume": rng.integers(100, 1000, n),
-    })
-
-
-@st.cache_data(ttl=60)
-def delta_candles(symbol, resolution, count):
-    """Delta Exchange India public candles API (API key ki zaroorat nahi)."""
-    secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}[resolution]
-    end = int(time.time())
-    start = end - secs * count
-    r = requests.get(
-        "https://api.india.delta.exchange/v2/history/candles",
-        params={"symbol": symbol, "resolution": resolution, "start": start, "end": end},
-        timeout=15,
+    # CSV Download Button
+    csv_data = df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Option Chain Data (CSV)",
+        data=csv_data,
+        file_name=f"option_chain_{symbol_choice}_{EXPIRY_DATE}.csv",
+        mime="text/csv"
     )
-    r.raise_for_status()
-    data = r.json().get("result", [])
-    if not data:
-        raise ValueError("Koi candle data nahi mila. Symbol check karein.")
-    df = pd.DataFrame(data)
-    df["time"] = pd.to_datetime(df["time"], unit="s")
-    return df.sort_values("time").reset_index(drop=True)[["time", "open", "high", "low", "close", "volume"]]
 
+    # OI Bar Chart with Reversal line
+    fig_oi = go.Figure()
+    fig_oi.add_trace(go.Bar(x=df['Strike'], y=df['C_OI'], name='Call OI (Resistance)', marker_color='#ff7675'))
+    fig_oi.add_trace(go.Bar(x=df['Strike'], y=df['P_OI'], name='Put OI (Support)', marker_color='#55efc4'))
+    
+    for idx, sz in enumerate(oi_supply_zones):
+        fig_oi.add_vline(x=sz, line_dash="dash", line_color="#d63031", line_width=2, annotation_text=f"Supply {idx+1} ({sz})", annotation_position="top right")
+    for idx, dz in enumerate(oi_demand_zones):
+        fig_oi.add_vline(x=dz, line_dash="dash", line_color="#00b894", line_width=2, annotation_text=f"Demand {idx+1} ({dz})", annotation_position="bottom right")
+    
+    # Reversal Line on Chart
+    fig_oi.add_vline(x=reversal_price, line_dash="solid", line_color="#fdcb6e", line_width=3, annotation_text=f"Reversal Trigger ({reversal_price})", annotation_position="top left")
 
-def load_csv(file):
-    df = pd.read_csv(file)
-    df.columns = [c.strip().lower() for c in df.columns]
-    need = {"time", "open", "high", "low", "close"}
-    if not need.issubset(df.columns):
-        raise ValueError(f"CSV mein ye columns chahiye: {sorted(need)} (volume optional)")
-    if "volume" not in df.columns:
-        df["volume"] = 0
-    df["time"] = pd.to_datetime(df["time"])
-    return df.sort_values("time").reset_index(drop=True)
+    fig_oi.update_layout(barmode='group', xaxis_title="Strike Price", yaxis_title="Open Interest", template="plotly_dark", height=600)
 
+    # Volume Bar Chart
+    fig_vol = go.Figure()
+    fig_vol.add_trace(go.Bar(x=df['Strike'], y=df['C_Vol'], name='Call Volume', marker_color='#e17055'))
+    fig_vol.add_trace(go.Bar(x=df['Strike'], y=df['P_Vol'], name='Put Volume', marker_color='#0984e3'))
+    for idx, sz in enumerate(vol_supply_zones):
+        fig_vol.add_vline(x=sz, line_dash="dash", line_color="#d63031", line_width=2, annotation_text=f"Vol Res {idx+1} ({sz})", annotation_position="top right")
+    for idx, dz in enumerate(vol_demand_zones):
+        fig_vol.add_vline(x=dz, line_dash="dash", line_color="#00b894", line_width=2, annotation_text=f"Vol Sup {idx+1} ({sz})", annotation_position="bottom right")
+    fig_vol.update_layout(barmode='group', xaxis_title="Strike Price", yaxis_title="Volume", template="plotly_dark", height=600)
 
-# ---------------------------------------------------------------- UI
-st.title("Liquidity Scanner")
-st.caption("Equal highs/lows aur liquidity sweeps. Ye research tool hai, trade signal nahi.")
+    # Option Chain Table Styling
+    def style_option_chain(row):
+        strike = row['Strike']
+        styles = [''] * len(row)
+        is_atm = abs(strike - underlying_price) <= 25
+        is_supply = strike in oi_supply_zones
+        is_demand = strike in oi_demand_zones
+        is_reversal = (strike == reversal_price)
 
-with st.sidebar:
-    st.header("Data")
-    source = st.radio("Source", ["Demo", "CSV upload", "Delta Exchange India"])
-    tol = st.slider("Equal level tolerance (%)", 0.02, 0.5, 0.10, 0.01)
-    lookback = st.slider("Sweep lookback (candles)", 5, 60, 20)
+        for i, col in enumerate(row.index):
+            if is_atm:
+                styles[i] = 'background-color: #cfe2ff; font-weight: bold; border-top: 2px solid #0d6efd; border-bottom: 2px solid #0d6efd;'
+            elif is_reversal:
+                styles[i] = 'background-color: #fff3cd; font-weight: bold; border: 1.5px solid #ffc107;'
+            elif is_supply and 'C_' in col:
+                styles[i] = 'background-color: #f8d7da; font-weight: bold; border: 1.5px solid #dc3545;'
+            elif is_demand and 'P_' in col:
+                styles[i] = 'background-color: #d1e7dd; font-weight: bold; border: 1.5px solid #198754;'
+            elif strike < underlying_price and 'C_' in col:
+                styles[i] = 'background-color: #fff3cd;'
+            elif strike > underlying_price and 'P_' in col:
+                styles[i] = 'background-color: #e2f0d9;'
+        return styles
 
-df, err = None, None
-try:
-    if source == "Demo":
-        df = demo_data()
-    elif source == "CSV upload":
-        f = st.sidebar.file_uploader("OHLCV CSV", type="csv")
-        if f:
-            df = load_csv(f)
+    styled_df = df.style.apply(style_option_chain, axis=1).bar(
+        subset=['C_Vol', 'C_OI'], color='#ffccd5', vmin=0
+    ).bar(
+        subset=['P_Vol', 'P_OI'], color='#d1e7dd', vmin=0
+    )
+
+    # Display based on user choice
+    if view_mode == "📋 Option Chain Table":
+        st.dataframe(styled_df, use_container_width=True, height=600)
+    elif view_mode == "📊 OI Chart with Zones":
+        st.plotly_chart(fig_oi, use_container_width=True)
     else:
-        sym = st.sidebar.text_input("Symbol", "BTCUSD")
-        res = st.sidebar.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=2)
-        cnt = st.sidebar.slider("Candles", 100, 500, 300)
-        df = delta_candles(sym, res, cnt)
-except Exception as e:
-    err = str(e)
-
-if err:
-    st.error(err)
-elif df is None:
-    st.info("CSV upload karein ya sidebar se koi aur source chunein.")
+        st.plotly_chart(fig_vol, use_container_width=True)
 else:
-    buy_side, sell_side = liquidity_zones(df, tol)
-    sweeps = detect_sweeps(df, lookback)
-    last = float(df["close"].iloc[-1])
-
-    fig = go.Figure(go.Candlestick(
-        x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Price"))
-    for z in buy_side:
-        fig.add_hline(y=z["level"], line_dash="dot", line_color="#d9534f",
-                      annotation_text=f"EQH x{z['touches']}", annotation_position="right")
-    for z in sell_side:
-        fig.add_hline(y=z["level"], line_dash="dot", line_color="#2e9e5b",
-                      annotation_text=f"EQL x{z['touches']}", annotation_position="right")
-    if len(sweeps):
-        for kind, color, sym_ in [("BEARISH_SWEEP", "#d9534f", "triangle-down"),
-                                  ("BULLISH_SWEEP", "#2e9e5b", "triangle-up")]:
-            s = sweeps[sweeps["type"] == kind]
-            fig.add_trace(go.Scatter(x=s["time"], y=s["price"], mode="markers", name=kind,
-                                     marker=dict(symbol=sym_, size=10, color=color)))
-    fig.update_layout(height=600, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Last price", f"{last:,.2f}")
-    c2.metric("Buy-side zones (EQH)", len(buy_side))
-    c3.metric("Sell-side zones (EQL)", len(sell_side))
-
-    left, right = st.columns(2)
-    with left:
-        st.subheader("Upar ki liquidity (EQH)")
-        t = pd.DataFrame(buy_side)
-        if len(t):
-            t["distance_%"] = ((t["level"] - last) / last * 100).round(2)
-            st.dataframe(t.sort_values("distance_%", key=abs), hide_index=True, use_container_width=True)
-        else:
-            st.write("Koi zone nahi mila.")
-    with right:
-        st.subheader("Neeche ki liquidity (EQL)")
-        t = pd.DataFrame(sell_side)
-        if len(t):
-            t["distance_%"] = ((t["level"] - last) / last * 100).round(2)
-            st.dataframe(t.sort_values("distance_%", key=abs), hide_index=True, use_container_width=True)
-        else:
-            st.write("Koi zone nahi mila.")
-
-    st.subheader("Haal ke sweeps")
-    if len(sweeps):
-        st.dataframe(sweeps.tail(10).iloc[::-1], hide_index=True, use_container_width=True)
-    else:
-        st.write("Koi sweep nahi mila.")
-
-st.caption("Disclaimer: Ye financial salah nahi hai. Liquidity levels sirf sambhavit jagah batate hain.")
+    st.warning("Data fetch nahi ho pa raha hai. Kripya apna Access Token ya Expiry date check karein.")
+    
