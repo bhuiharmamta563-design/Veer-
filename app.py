@@ -1,6 +1,11 @@
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:       # package na ho to bhi app chalega
+    st_autorefresh = None
 from pathlib import Path
 
 import numpy as np
@@ -70,7 +75,8 @@ def parse_chain(js):
             CE_OI=ce.get("openInterest", 0), CE_ChgOI=ce.get("changeinOpenInterest", 0),
             CE_Vol=ce.get("totalTradedVolume", 0), CE_LTP=ce.get("lastPrice", 0),
             PE_OI=pe.get("openInterest", 0), PE_ChgOI=pe.get("changeinOpenInterest", 0),
-            PE_Vol=pe.get("totalTradedVolume", 0), PE_LTP=pe.get("lastPrice", 0)))
+            PE_Vol=pe.get("totalTradedVolume", 0), PE_LTP=pe.get("lastPrice", 0),
+            CE_IV=ce.get("impliedVolatility", 0), PE_IV=pe.get("impliedVolatility", 0)))
     df = pd.DataFrame(rows)
     if df.empty:
         return None
@@ -159,12 +165,17 @@ def up_chain_rows(ikey, expiry, token):
         co = (it.get("call_options") or {}).get("market_data") or {}
         po = (it.get("put_options") or {}).get("market_data") or {}
         g = lambda m, k: m.get(k) or 0
+        cg = (it.get("call_options") or {}).get("option_greeks") or {}
+        pg = (it.get("put_options") or {}).get("option_greeks") or {}
         rows.append(dict(
             Expiry=expiry, Strike=it.get("strike_price"),
             CE_OI=g(co, "oi"), CE_ChgOI=g(co, "oi") - g(co, "prev_oi"),
             CE_Vol=g(co, "volume"), CE_LTP=g(co, "ltp"),
             PE_OI=g(po, "oi"), PE_ChgOI=g(po, "oi") - g(po, "prev_oi"),
-            PE_Vol=g(po, "volume"), PE_LTP=g(po, "ltp")))
+            PE_Vol=g(po, "volume"), PE_LTP=g(po, "ltp"),
+            CE_IV=g(cg, "iv"), PE_IV=g(pg, "iv"),
+            CE_Delta=g(cg, "delta"), CE_Theta=g(cg, "theta"),
+            PE_Delta=g(pg, "delta"), PE_Theta=g(pg, "theta")))
         spot = it.get("underlying_spot_price") or spot
     return pd.DataFrame(rows), spot
 
@@ -193,6 +204,155 @@ def on_fetch_upstox():
     st.session_state["exp_sel"] = exps[0]
     apply_levels()
     st.session_state["nse_msg"] = ("success", f"Upstox data mil gaya · Spot {spot}")
+
+
+# ---------------- Alerts (Telegram) ----------------
+@st.cache_resource
+def alert_store():
+    return {}          # sab sessions me shared: (symbol, level) -> {near, t}
+
+
+def tg_creds():
+    tok = str(st.session_state.get("tg_tok_in", "")).strip()
+    chat = str(st.session_state.get("tg_chat_in", "")).strip()
+    try:
+        tok = tok or str(st.secrets.get("TELEGRAM_BOT_TOKEN", "")).strip()
+        chat = chat or str(st.secrets.get("TELEGRAM_CHAT_ID", "")).strip()
+    except Exception:
+        pass
+    return tok, chat
+
+
+def send_tg(text):
+    tok, chat = tg_creds()
+    if not tok or not chat:
+        return False, "Telegram token / chat id nahi mila."
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                          data={"chat_id": chat, "text": text}, timeout=10)
+        if r.status_code == 200:
+            return True, ""
+        return False, f"Telegram error {r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return False, f"Telegram connect nahi hua ({type(e).__name__})."
+
+
+def market_open():
+    n = datetime.now(IST)
+    return n.weekday() < 5 and (9, 15) <= (n.hour, n.minute) <= (15, 30)
+
+
+def check_alerts(symbol, ltp, levels, pts, cooldown_min, only_mkt):
+    """Price level ke 'pts' ke andar aate hi (far -> near) ek baar alert bhejta hai."""
+    sent, errs = [], []
+    if only_mkt and not market_open():
+        return sent, errs
+    store, now = alert_store(), datetime.now(IST)
+    for name, lvl in levels.items():
+        rec = store.get((symbol, name), {"near": False, "t": None})
+        near = abs(ltp - lvl) <= pts
+        cooled = rec["t"] is None or (now - rec["t"]).total_seconds() >= cooldown_min * 60
+        if near and not rec["near"] and cooled:
+            ok, err = send_tg(f"🔔 {symbol}: LTP {ltp:,.2f} ne {name} ({lvl:,.2f}) ke paas aa gaya "
+                              f"({ltp - lvl:+.1f} pts)")
+            if ok:
+                rec["t"], rec["near"] = now, True
+                sent.append(name)
+            else:
+                errs.append(err)       # near False rakho taaki agli baar retry ho
+        elif not near:
+            rec["near"] = False
+        store[(symbol, name)] = rec
+    return sent, errs
+
+
+# ---------------- Option chain table (HTML) ----------------
+@st.cache_data(ttl=15, show_spinner=False)
+def up_chain_cached(ikey, expiry, _token):
+    return up_chain_rows(ikey, expiry, _token)
+
+
+def _k(v):
+    v = float(v or 0)
+    return f"{v / 1000:,.0f}K" if abs(v) >= 1000 else f"{v:,.0f}"
+
+
+def chain_html(d, spot, cip, pip, n, greeks=False, scale_all=False):
+    d = d.sort_values("Strike").reset_index(drop=True)
+    atm = (d["Strike"] - spot).abs().idxmin()
+    ref = d if scale_all else None          # poore chain ka max reference
+    d = d.iloc[max(atm - n, 0): atm + n + 1]
+    ref = d if ref is None else ref
+    atm_strike = d.loc[atm, "Strike"] if atm in d.index else None
+    mx = lambda c: max(float(ref[c].max()), 1.0)
+    mc, mp, mcv, mpv = mx("CE_OI"), mx("PE_OI"), mx("CE_Vol"), mx("PE_Vol")
+    base = "padding:6px 8px;text-align:right;white-space:nowrap;vertical-align:top;"
+    itm_c = "rgba(255,235,59,0.10)"
+
+    def num(r, key):
+        v = r.get(key)
+        return 0.0 if v is None or v != v else float(v)
+
+    def td(txt, extra=""):
+        return f'<td style="{base}{extra}">{txt}</td>'
+
+    def pill(pct, col):
+        full = pct >= 99.5
+        c_ = col if full else "rgba(128,128,128,.9)"
+        st_ = (f"display:inline-block;font-size:10px;margin-top:2px;padding:0 4px;border-radius:4px;"
+               f"border:1px solid {c_};color:{c_};font-weight:{700 if full else 400};")
+        return f'<div><span style="{st_}">{pct:.0f}%</span></div>'
+
+    def chg(v, bg=""):
+        v = float(v or 0) / 1e5
+        col = "#26a69a" if v > 0 else "#ef5350" if v < 0 else "inherit"
+        return td(f"{v:+.1f}", f"color:{col};{bg}")
+
+    def bar(pct, rgb, to, shade):
+        g = f"linear-gradient(to {to},rgba({rgb},.45) {pct:.0f}%,transparent {pct:.0f}%)"
+        return f"background:{g},{itm_c};" if shade else f"background:{g};"
+
+    # Calls: LTP | OI Chg | OI | Volume || Strike || Volume | OI | OI Chg | LTP  (Puts)
+    head = ["LTP", "OI Chg", "OI (L)", "Volume"] + (["Δ", "Θ"] if greeks else []) + ["Strike"] + \
+           (["Θ", "Δ"] if greeks else []) + ["Volume", "OI (L)", "OI Chg", "LTP"]
+    width = 780 if greeks else 640
+    html = [f'<div style="overflow-x:auto;"><table style="border-collapse:collapse;min-width:{width}px;width:100%;font-size:13px;">']
+    html.append('<tr style="border-bottom:1px solid rgba(128,128,128,.4);">'
+                + "".join(f'<th style="{base}font-size:11px;opacity:.7;{"text-align:center;" if h == "Strike" else ""}">{h}</th>' for h in head) + "</tr>")
+    spot_row = (f'<tr><td colspan="{len(head)}" style="padding:2px 0;text-align:center;'
+                f'background:linear-gradient(#ffb300,#ffb300) center/100% 2px no-repeat;">'
+                f'<span style="background:#ffb300;color:#1a1a1a;font-size:11px;font-weight:700;'
+                f'padding:1px 12px;border-radius:10px;">&#9654; Spot {spot:,.2f}</span></td></tr>')
+    placed = False
+    for _, r in d.iterrows():
+        k = r["Strike"]
+        if not placed and k > spot:          # market jis jagah chal raha hai, wahan line
+            html.append(spot_row)
+            placed = True
+        c_shade, p_shade = k < spot, k > spot
+        c_bg = f"background:{itm_c};" if c_shade else ""
+        p_bg = f"background:{itm_c};" if p_shade else ""
+        cp, pp = r["CE_OI"] / mc * 100, r["PE_OI"] / mp * 100
+        badge = (" 🔴CIP" if k == cip else "") + (" 🟢PIP" if k == pip else "")
+        kcell = "background:rgba(41,98,255,.45);font-weight:700;" if k == atm_strike else "font-weight:600;"
+        cells = [td(f"{r['CE_LTP']:,.2f}", c_bg),
+                 chg(r["CE_ChgOI"], c_bg),
+                 td(f"{r['CE_OI'] / 1e5:,.1f}" + pill(cp, "#ef5350"), bar(cp, "239,83,80", "left", c_shade)),
+                 td(_k(r["CE_Vol"]) + pill(r["CE_Vol"] / mcv * 100, "#ef5350"), c_bg)]
+        if greeks:
+            cells += [td(f"{num(r, 'CE_Delta'):.2f}", "opacity:.8;"), td(f"{num(r, 'CE_Theta'):.1f}", "opacity:.8;")]
+        cells += [td(f"{k:,.0f}{badge}", "text-align:center;" + kcell)]
+        if greeks:
+            cells += [td(f"{num(r, 'PE_Theta'):.1f}", "opacity:.8;"), td(f"{num(r, 'PE_Delta'):.2f}", "opacity:.8;")]
+        cells += [td(_k(r["PE_Vol"]) + pill(r["PE_Vol"] / mpv * 100, "#26a69a"), p_bg),
+                  td(f"{r['PE_OI'] / 1e5:,.1f}" + pill(pp, "#26a69a"), bar(pp, "38,166,154", "right", p_shade)),
+                  chg(r["PE_ChgOI"], p_bg),
+                  td(f"{r['PE_LTP']:,.2f}", p_bg)]
+        html.append("<tr>" + "".join(cells) + "</tr>")
+    if not placed:
+        html.append(spot_row)
+    html.append("</table></div>")
+    return "".join(html)
 
 
 def apply_levels():
@@ -336,10 +496,31 @@ with st.sidebar:
             buf_p = st.number_input("Put buffer (points)", value=12.0, step=1.0, min_value=0.0)
             buf_pct = None
         show_rev = st.checkbox("Chart par EOS / EOR lines dikhao", True)
+        show_be = st.checkbox("Break-even lines bhi dikhao", False)
 
     call_be, put_be = cs + cltp, ps - pltp
     eor = call_be - buf_c        # Upper reversal
     eos = put_be + buf_p         # Lower reversal
+
+    # ---------- Alerts + auto refresh ----------
+    with st.expander("🔔 Alerts (Telegram) + Auto refresh", expanded=False):
+        refresh_s = st.selectbox("Auto refresh", ["Off", "15 sec", "30 sec", "60 sec"])
+        alert_on = st.checkbox("Level ke paas aane par Telegram alert", False)
+        alert_pts = st.number_input("Kitne points paas aane par", value=10.0, min_value=0.5, step=1.0)
+        cooldown = st.number_input("Dobara alert (minute baad)", value=30, min_value=1, step=5)
+        only_mkt = st.checkbox("Sirf market hours (9:15–3:30)", True)
+        if all(tg_creds()):
+            st.caption("✅ Telegram details mil gayi")
+        else:
+            st.text_input("Telegram Bot Token", type="password", key="tg_tok_in")
+            st.text_input("Telegram Chat ID", key="tg_chat_in")
+        if st.button("📨 Test alert bhejo"):
+            ok, err = send_tg("✅ Vajra Analytics: test alert")
+            if ok:
+                st.success("Bhej diya, Telegram check karo.")
+            else:
+                st.error(err)
+        st.caption("Alert tabhi chalega jab app/tab khula ho aur Auto refresh on ho.")
 
     # ---------- Quick reference (PDF) ----------
     st.divider()
@@ -375,12 +556,18 @@ with st.sidebar:
                            file_name=pdf_path.name, mime="application/pdf",
                            width="stretch")
 
+if refresh_s != "Off":
+    if st_autorefresh:
+        st_autorefresh(interval=int(refresh_s.split()[0]) * 1000, key="auto_ref")
+    else:
+        st.sidebar.warning("streamlit-autorefresh install nahi hua (requirements.txt check karo).")
+
 T = THEMES[theme]
 ticker = {"NIFTY 50": "^NSEI", "BANKNIFTY": "^NSEBANK"}.get(preset, f"{custom}.NS")
 period = {"1m": "5d", "5m": "30d", "15m": "30d", "30m": "60d", "1h": "180d", "1d": "2y"}[interval]
 
 
-@st.cache_data(ttl=60, show_spinner="Data aa raha hai...")
+@st.cache_data(ttl=20, show_spinner="Data aa raha hai...")
 def load(tkr, period, interval, src="Free", ikey="", _token=""):
     note = ""
     if src == "Upstox" and ikey and _token:
@@ -444,13 +631,14 @@ def build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p):
         h = hex_.lstrip("#")
         return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{a})"
 
-    def band(lo, hi, col, label):
+    def band(lo, hi, col, label, pos="top"):
         fig.add_trace(go.Scatter(x=[x0, x1, x1, x0, x0], y=[lo, lo, hi, hi, lo], mode="lines",
                                  fill="toself", fillcolor=rgba(col, zone_op), line=dict(width=0),
                                  hoverinfo="skip", showlegend=False, name=label), row=1, col=1)
-        fig.add_annotation(xref="x domain", yref="y", x=0.005, y=hi, xanchor="left",
-                           yanchor="top", showarrow=False, text=f"{label}  {lo:,.0f}–{hi:,.0f}",
-                           font=dict(size=11, color=T["text"]))
+        ay, an = {"top": (hi, "top"), "above": (hi, "bottom"), "below": (lo, "top")}[pos]
+        fig.add_annotation(xref="x domain", yref="y", x=0.005, y=ay, xanchor="left",
+                           yanchor=an, showarrow=False, text=f"{label} {lo:,.0f}–{hi:,.0f}",
+                           font=dict(size=10, color=T["text"]))
 
     def level(y, col, label, dash="dash", width=1):
         fig.add_trace(go.Scatter(x=[x0, x1], y=[y, y], mode="lines", hoverinfo="skip",
@@ -461,18 +649,19 @@ def build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p):
                            font=dict(size=11, color=col))
 
     if show_zones:
-        band(cip + w1c, cip + w2c, "#ef5350", "Supply 2")
+        band(cip + w1c, cip + w2c, "#ef5350", "Supply 2", "above")
         band(cip, cip + w1c, "#ff9800", "Supply 1")
         band(pip - w1p, pip, "#26a69a", "Demand 1")
-        band(pip - w2p, pip - w1p, "#00897b", "Demand 2")
+        band(pip - w2p, pip - w1p, "#00897b", "Demand 2", "below")
         level(cip, "#ff9800", "CIP")
         level(pip, "#26a69a", "PIP")
 
     if show_rev:
         level(eor, "#e040fb", f"EOR {eor:,.1f}", dash="dashdot", width=1.5)
         level(eos, "#00e5ff", f"EOS {eos:,.1f}", dash="dashdot", width=1.5)
-        level(call_be, "#e040fb", f"Call B/E {call_be:,.0f}", dash="dot")
-        level(put_be, "#00e5ff", f"Put B/E {put_be:,.0f}", dash="dot")
+        if show_be:
+            level(call_be, "#e040fb", f"Call B/E {call_be:,.0f}", dash="dot")
+            level(put_be, "#00e5ff", f"Put B/E {put_be:,.0f}", dash="dot")
 
     for tok in extra.split(","):
         try:
@@ -496,7 +685,9 @@ def build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p):
     if show_zones:
         lo_y, hi_y = min(lo_y, pip - w2p), max(hi_y, cip + w2c)
     if show_rev:
-        lo_y, hi_y = min(lo_y, eos, put_be), max(hi_y, eor, call_be)
+        lo_y, hi_y = min(lo_y, eos), max(hi_y, eor)
+        if show_be:
+            lo_y, hi_y = min(lo_y, put_be), max(hi_y, call_be)
     pad = (hi_y - lo_y) * 0.04
 
     fig.update_layout(
@@ -538,11 +729,24 @@ if pip >= cip:
 # ---------- Header strip ----------
 ltp = float(df["Close"].iloc[-1])
 chg = ltp - float(full["Close"].iloc[-2]) if len(full) > 1 else 0.0
-h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
-h1.subheader(f"{ticker}  ·  {interval}  ·  {used}")
+st.subheader(f"{ticker}  ·  {interval}  ·  {used}")
+h2, h3, h4 = st.columns(3)
 h2.metric("LTP", f"{ltp:,.2f}", f"{chg:+,.2f}")
 h3.metric("To CIP", f"{cip - ltp:,.1f}")
 h4.metric("To PIP", f"{ltp - pip:,.1f}")
+
+if alert_on:
+    sent, errs = check_alerts(preset if not stock_mode else custom, ltp,
+                              {"CIP": cip, "PIP": pip, "EOR": eor, "EOS": eos},
+                              alert_pts, cooldown, only_mkt)
+    for n_ in sent:
+        st.toast(f"🔔 Alert bheja: {n_}")
+    if errs:
+        st.warning(errs[0])
+    elif only_mkt and not market_open():
+        st.caption("🔔 Alerts ON · market band hai, isliye abhi nahi bhej raha.")
+    else:
+        st.caption(f"🔔 Alerts ON · CIP/PIP/EOR/EOS ke {alert_pts:g} pts paas aane par.")
 
 fig = build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p)
 
@@ -564,6 +768,48 @@ st.caption(
     "🗑 eraser dabao · Sab hatane ke liye sidebar ka 'Clear all drawings' · "
     "⛶ Fullscreen: chart par hover karke upar-right ka icon."
 )
+
+# ---------------- Option chain table ----------------
+st.divider()
+st.subheader("📋 Option Chain")
+ch = st.session_state.get("chain")
+if not ch:
+    st.info("Sidebar mein 'se CIP/PIP lao' button dabao, option chain yahan dikhega.")
+else:
+    exp = st.session_state.get("exp_sel") or ch["expiries"][0]
+    if ch.get("source") == "Upstox":      # live refresh (15 sec cache)
+        try:
+            nd, sp = up_chain_cached(ch["ikey"], exp, up_token())
+            if not nd.empty:
+                ch["df"] = pd.concat([ch["df"][ch["df"]["Expiry"] != exp], nd], ignore_index=True)
+                ch["underlying"] = sp or ch.get("underlying")
+        except Exception as e:
+            st.caption(f"Chain refresh nahi hua: {e}")
+    d_ch = ch["df"][ch["df"]["Expiry"] == exp]
+    if d_ch.empty:
+        st.warning("Is expiry ka data nahi mila.")
+    else:
+        spot = float(ch.get("underlying") or ltp)
+        n_str = st.slider("ATM ke upar/neeche kitne strikes", 3, 25, 10)
+        show_gk = st.checkbox("Greeks (Δ delta, Θ theta) dikhao", False)
+        scale_all = st.checkbox("% poore chain (saare strikes) ke sabse bade ke hisab se", False)
+        tc, tp = float(d_ch["CE_OI"].sum()), float(d_ch["PE_OI"].sum())
+        d_s = d_ch.sort_values("Strike")
+        a_row = d_s.iloc[int((d_s["Strike"] - spot).abs().values.argmin())]
+        synth = float(a_row["Strike"]) + float(a_row["CE_LTP"]) - float(a_row["PE_LTP"])
+        mcs = d_s.loc[d_s["CE_OI"].idxmax(), "Strike"]
+        mps = d_s.loc[d_s["PE_OI"].idxmax(), "Strike"]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Spot", f"{spot:,.2f}")
+        m2.metric("Synth Fut", f"{synth:,.2f}")
+        m3.metric("PCR (OI)", f"{tp / max(tc, 1):.2f}")
+        m4, m5, m6 = st.columns(3)
+        m4.metric("Max Call OI", f"{mcs:,.0f}")
+        m5.metric("Max Put OI", f"{mps:,.0f}")
+        m6.metric("Call / Put OI", f"{tc / 1e5:,.0f}L / {tp / 1e5:,.0f}L")
+        st.markdown(chain_html(d_ch, spot, cip, pip, n_str, show_gk, scale_all), unsafe_allow_html=True)
+        st.caption(f"Expiry {exp} · Spot {spot:,.2f} · Peeli line = Spot (market abhi yahan) · Neela strike = ATM · peela = ITM · "
+                   "🔴CIP / 🟢PIP = aapke levels · OI lakh mein, Volume K mein · % = " + ("poore chain" if scale_all else "visible strikes") + " mein sabse bade ke muqable.")
 
 # ---------------- Reversal calculator results ----------------
 st.divider()
