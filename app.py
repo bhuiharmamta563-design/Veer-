@@ -1,843 +1,194 @@
-from datetime import datetime, timedelta
-from urllib.parse import quote, urlencode
-from zoneinfo import ZoneInfo
-
-try:
-    from streamlit_autorefresh import st_autorefresh
-except Exception:       # package na ho to bhi app chalega
-    st_autorefresh = None
-from pathlib import Path
+"""
+Liquidity Scanner - Streamlit app
+Run:  streamlit run app.py
+"""
+import time
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import yfinance as yf
-from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="VAJRA ANALYTICS", layout="wide", page_icon="⚡")
-
-# ---------- TradingView-style palette ----------
-THEMES = {
-    "Dark": dict(bg="#131722", grid="#2a2e39", text="#d1d4dc", tmpl="plotly_dark"),
-    "Light": dict(bg="#ffffff", grid="#e0e3eb", text="#131722", tmpl="plotly_white"),
-}
-UP, DOWN = "#26a69a", "#ef5350"
-
-st.markdown(
-    "<style>.block-container{padding-top:1.2rem;padding-bottom:0.5rem}</style>",
-    unsafe_allow_html=True,
-)
-
-
-# ---------------- NSE option chain helpers ----------------
-NSE_HDR = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/option-chain",
-}
-BASIS = {"Max OI": "OI", "Max Volume": "Vol", "Max OI change": "ChgOI"}
-
-
-def nse_symbol():
-    p = st.session_state.get("preset", "NIFTY 50")
-    if p == "NIFTY 50":
-        return "NIFTY", False
-    if p == "BANKNIFTY":
-        return "BANKNIFTY", False
-    return st.session_state.get("custom_sym", "").strip().upper(), True
-
-
-def fetch_nse(symbol, is_stock):
-    kind = "equities" if is_stock else "indices"
-    url = f"https://www.nseindia.com/api/option-chain-{kind}?symbol={symbol}"
-    try:
-        sess = requests.Session()
-        sess.get("https://www.nseindia.com", headers=NSE_HDR, timeout=10)   # cookies
-        r = sess.get(url, headers=NSE_HDR, timeout=10)
-        if r.status_code != 200:
-            return None, f"NSE ne HTTP {r.status_code} diya (cloud IP block ho sakta hai)."
-        return r.json(), None
-    except Exception as e:
-        return None, f"NSE se connect nahi hua ({type(e).__name__}). Cloud IP block ho sakta hai."
-
-
-def parse_chain(js):
-    rec = (js or {}).get("records") or {}
-    rows = []
-    for it in rec.get("data", []):
-        ce, pe = it.get("CE") or {}, it.get("PE") or {}
-        rows.append(dict(
-            Expiry=it.get("expiryDate"), Strike=it.get("strikePrice"),
-            CE_OI=ce.get("openInterest", 0), CE_ChgOI=ce.get("changeinOpenInterest", 0),
-            CE_Vol=ce.get("totalTradedVolume", 0), CE_LTP=ce.get("lastPrice", 0),
-            PE_OI=pe.get("openInterest", 0), PE_ChgOI=pe.get("changeinOpenInterest", 0),
-            PE_Vol=pe.get("totalTradedVolume", 0), PE_LTP=pe.get("lastPrice", 0),
-            CE_IV=ce.get("impliedVolatility", 0), PE_IV=pe.get("impliedVolatility", 0)))
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return None
-    exps = sorted(df["Expiry"].dropna().unique(), key=lambda x: datetime.strptime(x, "%d-%b-%Y"))
-    return dict(df=df, expiries=exps, underlying=rec.get("underlyingValue"))
-
-
-
-# ---------------- Upstox helpers (Analytics Token, read-only) ----------------
-UP_BASE = "https://api.upstox.com"
-UP_KEYS = {"NIFTY 50": "NSE_INDEX|Nifty 50", "BANKNIFTY": "NSE_INDEX|Nifty Bank"}
-UP_IV = {"1m": ("minutes", 1), "5m": ("minutes", 5), "15m": ("minutes", 15),
-         "30m": ("minutes", 30), "1h": ("hours", 1), "1d": ("days", 1)}
-UP_DAYS = {"1m": 5, "5m": 30, "15m": 30, "30m": 60, "1h": 90, "1d": 730}
-IST = ZoneInfo("Asia/Kolkata")
-
-
-def up_token():
-    tok = str(st.session_state.get("up_token_in", "")).strip()
-    if tok:
-        return tok
-    try:
-        return str(st.secrets.get("UPSTOX_TOKEN", "")).strip()
-    except Exception:
-        return ""
-
-
-def up_get(path, token, params=None):
-    url = UP_BASE + path
-    if params:
-        url += "?" + urlencode(params, quote_via=quote)
-    r = requests.get(url, timeout=15,
-                     headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
-    if r.status_code == 401:
-        raise RuntimeError("Upstox token galat ya expire hai (401).")
-    if r.status_code != 200:
-        raise RuntimeError(f"Upstox error {r.status_code}: {r.text[:150]}")
-    js = r.json()
-    if js.get("status") != "success":
-        raise RuntimeError(f"Upstox ne success nahi diya: {str(js)[:150]}")
-    return js.get("data")
-
-
-def _candles_df(rows):
-    cols = ["Open", "High", "Low", "Close", "Volume"]
-    if not rows:
-        return pd.DataFrame(columns=cols)
-    d = pd.DataFrame([r[:6] for r in rows], columns=["ts"] + cols)
-    d["ts"] = pd.to_datetime(d["ts"], utc=True).dt.tz_convert(IST)
-    return d.set_index("ts")
-
-
-def up_candles(ikey, interval, token):
-    unit, n = UP_IV[interval]
-    k = quote(ikey, safe="")
-    today = datetime.now(IST).date()
-    frm = today - timedelta(days=UP_DAYS[interval])
-    hist = up_get(f"/v3/historical-candle/{k}/{unit}/{n}/{today:%Y-%m-%d}/{frm:%Y-%m-%d}", token)
-    parts = [_candles_df((hist or {}).get("candles", []))]
-    try:   # aaj ki candles alag endpoint se
-        intra = up_get(f"/v3/historical-candle/intraday/{k}/{unit}/{n}", token)
-        parts.append(_candles_df((intra or {}).get("candles", [])))
-    except RuntimeError:
-        pass
-    d = pd.concat(parts)
-    d = d[~d.index.duplicated(keep="last")].sort_index()
-    return d.dropna()
-
-
-def _exp_str(v):
-    if isinstance(v, (int, float)):
-        return datetime.fromtimestamp(v / 1000, IST).strftime("%Y-%m-%d")
-    return str(v)[:10]
-
-
-def up_expiries(ikey, token):
-    data = up_get("/v2/option/contract", token, {"instrument_key": ikey}) or []
-    today = datetime.now(IST).strftime("%Y-%m-%d")
-    return sorted({e for e in (_exp_str(c.get("expiry")) for c in data if c.get("expiry")) if e >= today})
-
-
-def up_chain_rows(ikey, expiry, token):
-    data = up_get("/v2/option/chain", token, {"instrument_key": ikey, "expiry_date": expiry}) or []
-    rows, spot = [], None
-    for it in data:
-        co = (it.get("call_options") or {}).get("market_data") or {}
-        po = (it.get("put_options") or {}).get("market_data") or {}
-        g = lambda m, k: m.get(k) or 0
-        cg = (it.get("call_options") or {}).get("option_greeks") or {}
-        pg = (it.get("put_options") or {}).get("option_greeks") or {}
-        rows.append(dict(
-            Expiry=expiry, Strike=it.get("strike_price"),
-            CE_OI=g(co, "oi"), CE_ChgOI=g(co, "oi") - g(co, "prev_oi"),
-            CE_Vol=g(co, "volume"), CE_LTP=g(co, "ltp"),
-            PE_OI=g(po, "oi"), PE_ChgOI=g(po, "oi") - g(po, "prev_oi"),
-            PE_Vol=g(po, "volume"), PE_LTP=g(po, "ltp"),
-            CE_IV=g(cg, "iv"), PE_IV=g(pg, "iv"),
-            CE_Delta=g(cg, "delta"), CE_Theta=g(cg, "theta"),
-            PE_Delta=g(pg, "delta"), PE_Theta=g(pg, "theta")))
-        spot = it.get("underlying_spot_price") or spot
-    return pd.DataFrame(rows), spot
-
-
-def on_fetch_upstox():
-    tok, p = up_token(), st.session_state.get("preset", "NIFTY 50")
-    if not tok:
-        st.session_state["nse_msg"] = ("error", "Upstox token nahi mila. Sidebar mein token daalo.")
-        return
-    if p not in UP_KEYS:
-        st.session_state["nse_msg"] = ("error", "Upstox option chain abhi sirf NIFTY/BANKNIFTY ke liye hai. Stock ke liye Free source chuno.")
-        return
-    try:
-        ik = UP_KEYS[p]
-        exps = up_expiries(ik, tok)
-        if not exps:
-            raise RuntimeError("Expiry list khali aayi.")
-        df, spot = up_chain_rows(ik, exps[0], tok)
-        if df.empty:
-            raise RuntimeError("Option chain khali aayi.")
-    except Exception as e:
-        st.session_state["nse_msg"] = ("error", str(e))
-        return
-    st.session_state["chain"] = dict(df=df, expiries=exps, underlying=spot, symbol=p,
-                                     source="Upstox", ikey=ik)
-    st.session_state["exp_sel"] = exps[0]
-    apply_levels()
-    st.session_state["nse_msg"] = ("success", f"Upstox data mil gaya · Spot {spot}")
-
-
-# ---------------- Alerts (Telegram) ----------------
-@st.cache_resource
-def alert_store():
-    return {}          # sab sessions me shared: (symbol, level) -> {near, t}
-
-
-def tg_creds():
-    tok = str(st.session_state.get("tg_tok_in", "")).strip()
-    chat = str(st.session_state.get("tg_chat_in", "")).strip()
-    try:
-        tok = tok or str(st.secrets.get("TELEGRAM_BOT_TOKEN", "")).strip()
-        chat = chat or str(st.secrets.get("TELEGRAM_CHAT_ID", "")).strip()
-    except Exception:
-        pass
-    return tok, chat
-
-
-def send_tg(text):
-    tok, chat = tg_creds()
-    if not tok or not chat:
-        return False, "Telegram token / chat id nahi mila."
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                          data={"chat_id": chat, "text": text}, timeout=10)
-        if r.status_code == 200:
-            return True, ""
-        return False, f"Telegram error {r.status_code}: {r.text[:120]}"
-    except Exception as e:
-        return False, f"Telegram connect nahi hua ({type(e).__name__})."
-
-
-def market_open():
-    n = datetime.now(IST)
-    return n.weekday() < 5 and (9, 15) <= (n.hour, n.minute) <= (15, 30)
-
-
-def check_alerts(symbol, ltp, levels, pts, cooldown_min, only_mkt):
-    """Price level ke 'pts' ke andar aate hi (far -> near) ek baar alert bhejta hai."""
-    sent, errs = [], []
-    if only_mkt and not market_open():
-        return sent, errs
-    store, now = alert_store(), datetime.now(IST)
-    for name, lvl in levels.items():
-        rec = store.get((symbol, name), {"near": False, "t": None})
-        near = abs(ltp - lvl) <= pts
-        cooled = rec["t"] is None or (now - rec["t"]).total_seconds() >= cooldown_min * 60
-        if near and not rec["near"] and cooled:
-            ok, err = send_tg(f"🔔 {symbol}: LTP {ltp:,.2f} ne {name} ({lvl:,.2f}) ke paas aa gaya "
-                              f"({ltp - lvl:+.1f} pts)")
-            if ok:
-                rec["t"], rec["near"] = now, True
-                sent.append(name)
-            else:
-                errs.append(err)       # near False rakho taaki agli baar retry ho
-        elif not near:
-            rec["near"] = False
-        store[(symbol, name)] = rec
-    return sent, errs
-
-
-# ---------------- Option chain table (HTML) ----------------
-@st.cache_data(ttl=15, show_spinner=False)
-def up_chain_cached(ikey, expiry, _token):
-    return up_chain_rows(ikey, expiry, _token)
-
-
-def _k(v):
-    v = float(v or 0)
-    return f"{v / 1000:,.0f}K" if abs(v) >= 1000 else f"{v:,.0f}"
-
-
-def chain_html(d, spot, cip, pip, n, greeks=False, scale_all=False):
-    d = d.sort_values("Strike").reset_index(drop=True)
-    atm = (d["Strike"] - spot).abs().idxmin()
-    ref = d if scale_all else None          # poore chain ka max reference
-    d = d.iloc[max(atm - n, 0): atm + n + 1]
-    ref = d if ref is None else ref
-    atm_strike = d.loc[atm, "Strike"] if atm in d.index else None
-    mx = lambda c: max(float(ref[c].max()), 1.0)
-    mc, mp, mcv, mpv = mx("CE_OI"), mx("PE_OI"), mx("CE_Vol"), mx("PE_Vol")
-    base = "padding:6px 8px;text-align:right;white-space:nowrap;vertical-align:top;"
-    itm_c = "rgba(255,235,59,0.10)"
-
-    def num(r, key):
-        v = r.get(key)
-        return 0.0 if v is None or v != v else float(v)
-
-    def td(txt, extra=""):
-        return f'<td style="{base}{extra}">{txt}</td>'
-
-    def pill(pct, col):
-        full = pct >= 99.5
-        c_ = col if full else "rgba(128,128,128,.9)"
-        st_ = (f"display:inline-block;font-size:10px;margin-top:2px;padding:0 4px;border-radius:4px;"
-               f"border:1px solid {c_};color:{c_};font-weight:{700 if full else 400};")
-        return f'<div><span style="{st_}">{pct:.0f}%</span></div>'
-
-    def chg(v, bg=""):
-        v = float(v or 0) / 1e5
-        col = "#26a69a" if v > 0 else "#ef5350" if v < 0 else "inherit"
-        return td(f"{v:+.1f}", f"color:{col};{bg}")
-
-    def bar(pct, rgb, to, shade):
-        g = f"linear-gradient(to {to},rgba({rgb},.45) {pct:.0f}%,transparent {pct:.0f}%)"
-        return f"background:{g},{itm_c};" if shade else f"background:{g};"
-
-    # Calls: LTP | OI Chg | OI | Volume || Strike || Volume | OI | OI Chg | LTP  (Puts)
-    head = ["LTP", "OI Chg", "OI (L)", "Volume"] + (["Δ", "Θ"] if greeks else []) + ["Strike"] + \
-           (["Θ", "Δ"] if greeks else []) + ["Volume", "OI (L)", "OI Chg", "LTP"]
-    width = 780 if greeks else 640
-    html = [f'<div style="overflow-x:auto;"><table style="border-collapse:collapse;min-width:{width}px;width:100%;font-size:13px;">']
-    html.append('<tr style="border-bottom:1px solid rgba(128,128,128,.4);">'
-                + "".join(f'<th style="{base}font-size:11px;opacity:.7;{"text-align:center;" if h == "Strike" else ""}">{h}</th>' for h in head) + "</tr>")
-    spot_row = (f'<tr><td colspan="{len(head)}" style="padding:2px 0;text-align:center;'
-                f'background:linear-gradient(#ffb300,#ffb300) center/100% 2px no-repeat;">'
-                f'<span style="background:#ffb300;color:#1a1a1a;font-size:11px;font-weight:700;'
-                f'padding:1px 12px;border-radius:10px;">&#9654; Spot {spot:,.2f}</span></td></tr>')
-    placed = False
-    for _, r in d.iterrows():
-        k = r["Strike"]
-        if not placed and k > spot:          # market jis jagah chal raha hai, wahan line
-            html.append(spot_row)
-            placed = True
-        c_shade, p_shade = k < spot, k > spot
-        c_bg = f"background:{itm_c};" if c_shade else ""
-        p_bg = f"background:{itm_c};" if p_shade else ""
-        cp, pp = r["CE_OI"] / mc * 100, r["PE_OI"] / mp * 100
-        badge = (" 🔴CIP" if k == cip else "") + (" 🟢PIP" if k == pip else "")
-        kcell = "background:rgba(41,98,255,.45);font-weight:700;" if k == atm_strike else "font-weight:600;"
-        cells = [td(f"{r['CE_LTP']:,.2f}", c_bg),
-                 chg(r["CE_ChgOI"], c_bg),
-                 td(f"{r['CE_OI'] / 1e5:,.1f}" + pill(cp, "#ef5350"), bar(cp, "239,83,80", "left", c_shade)),
-                 td(_k(r["CE_Vol"]) + pill(r["CE_Vol"] / mcv * 100, "#ef5350"), c_bg)]
-        if greeks:
-            cells += [td(f"{num(r, 'CE_Delta'):.2f}", "opacity:.8;"), td(f"{num(r, 'CE_Theta'):.1f}", "opacity:.8;")]
-        cells += [td(f"{k:,.0f}{badge}", "text-align:center;" + kcell)]
-        if greeks:
-            cells += [td(f"{num(r, 'PE_Theta'):.1f}", "opacity:.8;"), td(f"{num(r, 'PE_Delta'):.2f}", "opacity:.8;")]
-        cells += [td(_k(r["PE_Vol"]) + pill(r["PE_Vol"] / mpv * 100, "#26a69a"), p_bg),
-                  td(f"{r['PE_OI'] / 1e5:,.1f}" + pill(pp, "#26a69a"), bar(pp, "38,166,154", "right", p_shade)),
-                  chg(r["PE_ChgOI"], p_bg),
-                  td(f"{r['PE_LTP']:,.2f}", p_bg)]
-        html.append("<tr>" + "".join(cells) + "</tr>")
-    if not placed:
-        html.append(spot_row)
-    html.append("</table></div>")
-    return "".join(html)
-
-
-def apply_levels():
-    """Selected expiry + basis se CIP/PIP nikal ke inputs me daalta hai (callback)."""
-    ch = st.session_state.get("chain")
-    if not ch:
-        return
-    exp = st.session_state.get("exp_sel")
-    if exp not in ch["expiries"]:
-        exp = st.session_state["exp_sel"] = ch["expiries"][0]
-    if ch.get("source") == "Upstox" and exp not in set(ch["df"]["Expiry"]):
-        try:
-            nd, _ = up_chain_rows(ch["ikey"], exp, up_token())
-            ch["df"] = pd.concat([ch["df"], nd], ignore_index=True)
-        except Exception as e:
-            st.session_state["nse_msg"] = ("error", str(e))
-            return
-    m = BASIS[st.session_state.get("basis", "Max OI")]
-    d = ch["df"][ch["df"]["Expiry"] == exp]
-    if d.empty:
-        st.session_state["nse_msg"] = ("error", "Is expiry ka data khali hai.")
-        return
-    c, p = d.loc[d[f"CE_{m}"].idxmax()], d.loc[d[f"PE_{m}"].idxmax()]
-    pr = st.session_state.get("preset", "NIFTY 50")
-    st.session_state[f"cip_{pr}"] = float(c["Strike"])
-    st.session_state[f"pip_{pr}"] = float(p["Strike"])
-    st.session_state["lvl_info"] = f"{ch['symbol']} · {exp} · {st.session_state.get('basis', 'Max OI')}"
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def up_expiries_cached(ikey, _token):
-    return up_expiries(ikey, _token)
-
-
-def auto_levels():
-    """Har run par option chain laakar CIP/PIP (aur zones) apne aap update karta hai."""
-    tok, p = up_token(), st.session_state.get("preset", "NIFTY 50")
-    if not tok or p not in UP_KEYS:
-        return
-    ik = UP_KEYS[p]
-    try:
-        exps = up_expiries_cached(ik, tok)
-        if not exps:
-            raise RuntimeError("Expiry list khali aayi.")
-        ch = st.session_state.get("chain")
-        exp = st.session_state.get("exp_sel")
-        if exp not in exps:
-            exp = exps[0]
-            st.session_state["exp_sel"] = exp
-        df, spot = up_chain_cached(ik, exp, tok)
-        if df.empty:
-            raise RuntimeError("Option chain khali aayi.")
-        if not ch or ch.get("ikey") != ik or ch.get("source") != "Upstox":
-            ch = dict(df=df, expiries=exps, underlying=spot, symbol=p, source="Upstox", ikey=ik)
-        else:
-            ch["df"] = pd.concat([ch["df"][ch["df"]["Expiry"] != exp], df], ignore_index=True)
-            ch["underlying"], ch["expiries"] = spot, exps
-        st.session_state["chain"] = ch
-        apply_levels()
-        st.session_state["nse_msg"] = ("success", f"Auto-update ON · Spot {spot}")
-    except Exception as e:
-        st.session_state["nse_msg"] = ("error", f"Auto levels nahi aaye: {e}")
-
-
-def on_fetch():
-    if st.session_state.get("src") == "Upstox":
-        return on_fetch_upstox()
-    sym, stock = nse_symbol()
-    if not sym:
-        st.session_state["nse_msg"] = ("error", "Pehle stock ka NSE symbol likho.")
-        return
-    js, err = fetch_nse(sym, stock)
-    ch = None if err else parse_chain(js)
-    if err or not ch:
-        st.session_state["nse_msg"] = ("error", err or "Option chain data parse nahi hua.")
-        return
-    ch["symbol"] = sym
-    st.session_state["chain"] = ch
-    st.session_state["exp_sel"] = ch["expiries"][0]
-    apply_levels()
-    st.session_state["nse_msg"] = ("success", f"Data mil gaya · Spot {ch['underlying']}")
-
-
-# ---------------- Sidebar ----------------
-with st.sidebar:
-    st.header("⚡ VAJRA ANALYTICS")
-    preset = st.selectbox("Instrument", ["NIFTY 50", "BANKNIFTY", "Custom (stock)"], key="preset")
-    custom = ""
-    if preset == "Custom (stock)":
-        custom = st.text_input("NSE symbol (e.g. RELIANCE)", "RELIANCE", key="custom_sym").strip().upper()
-    stock_mode = preset == "Custom (stock)"
-
-    st.subheader("Data source")
-    src = st.radio("Chart + option chain", ["Upstox", "Free (yfinance/NSE)"],
-                   index=0 if up_token() else 1, key="src", horizontal=True)
-    if src == "Upstox":
-        if not up_token():
-            st.text_input("Upstox Analytics Token", type="password", key="up_token_in",
-                          help="Upstox Developer Apps -> Analytics tab -> Generate Token")
-        else:
-            st.caption("✅ Upstox token mil gaya")
-            with st.expander("Token badlo"):
-                st.text_input("Naya token", type="password", key="up_token_in")
-        if stock_mode:
-            st.caption("⚠️ Stock ke liye Upstox abhi on nahi hai, Free source use hoga.")
-
-    st.subheader("Option chain levels")
-    st.button(f"📡 {'Upstox' if src == 'Upstox' else 'NSE'} se CIP/PIP lao", on_click=on_fetch, type="primary", width="stretch")
-    auto_lv = st.checkbox("🔄 CIP/PIP auto-update (option chain se, har refresh par)", value=True,
-                          key="auto_lv", disabled=(src != "Upstox" or stock_mode))
-    if auto_lv and src == "Upstox" and not stock_mode and up_token():
-        auto_levels()
-    st.selectbox("CIP/PIP kis basis par", list(BASIS), key="basis", on_change=apply_levels)
-    if st.session_state.get("chain"):
-        st.selectbox("Expiry", st.session_state["chain"]["expiries"], key="exp_sel", on_change=apply_levels)
-    kind, msg = st.session_state.get("nse_msg", (None, None))
-    if kind == "success":
-        st.success(msg)
-        st.caption(f"Levels: {st.session_state.get('lvl_info', '')}")
-    elif kind == "error":
-        st.error(msg + " Neeche CIP/PIP manually daal sakte ho.")
-
-    d_cip, d_pip = {"NIFTY 50": (23300.0, 23200.0), "BANKNIFTY": (51500.0, 51000.0)}.get(
-        preset, (3000.0, 2900.0))
-    st.session_state.setdefault(f"cip_{preset}", d_cip)
-    st.session_state.setdefault(f"pip_{preset}", d_pip)
-    cip = st.number_input("CIP (Call important price)", step=5.0, key=f"cip_{preset}")
-    pip = st.number_input("PIP (Put important price)", step=5.0, key=f"pip_{preset}")
-
-    st.subheader("Zone size")
-    if stock_mode:
-        p1 = st.number_input("Zone 1 width (%)", value=0.5, step=0.1)
-        p2 = st.number_input("Zone 2 width (%)", value=1.0, step=0.1)
-        w1c, w2c, w1p, w2p = cip * p1 / 100, cip * p2 / 100, pip * p1 / 100, pip * p2 / 100
-    else:
-        w1 = st.number_input("Zone 1 width (points)", value=25.0, step=5.0)
-        w2 = st.number_input("Zone 2 width (points)", value=50.0, step=5.0)
-        w1c = w1p = w1
-        w2c = w2p = w2
-
-    st.subheader("Chart settings")
-    interval = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "1d"], index=2)
-    chart_type = st.selectbox("Chart type", ["Candles", "Heikin Ashi", "OHLC bars", "Line"])
-    theme = st.radio("Theme", list(THEMES), horizontal=True)
-    height = st.slider("Chart height (px)", 400, 1100, 700, 50)
-    bars = st.slider("Bars to show", 30, 500, 150, 10)
-    show_zones = st.checkbox("Show zones", True)
-    zone_op = st.slider("Zone opacity", 0.05, 0.6, 0.22, 0.01)
-    show_vol = st.checkbox("Volume", True)
-    ema_on = st.multiselect("EMA", [9, 20, 50, 200], default=[20])
-    show_last = st.checkbox("Last price line", True)
-    st.subheader("Drawing tools")
-    draw_col = st.color_picker("Draw colour", "#ffeb3b")
-    draw_w = st.slider("Draw line width", 1, 6, 2)
-    extra = st.text_input("Extra price levels (comma se alag)", "", placeholder="23350, 23100")
-    if "clear_n" not in st.session_state:
-        st.session_state.clear_n = 0
-    if st.button("🗑️ Clear all drawings", width="stretch"):
-        st.session_state.clear_n += 1
-    refresh = st.button("🔄 Refresh data", width="stretch")
-
-    # ---------- Alerts + auto refresh ----------
-    with st.expander("🔔 Alerts (Telegram) + Auto refresh", expanded=False):
-        refresh_s = st.selectbox("Auto refresh", ["Off", "15 sec", "30 sec", "60 sec"])
-        alert_on = st.checkbox("Level ke paas aane par Telegram alert", False)
-        alert_pts = st.number_input("Kitne points paas aane par", value=10.0, min_value=0.5, step=1.0)
-        cooldown = st.number_input("Dobara alert (minute baad)", value=30, min_value=1, step=5)
-        only_mkt = st.checkbox("Sirf market hours (9:15–3:30)", True)
-        if all(tg_creds()):
-            st.caption("✅ Telegram details mil gayi")
-        else:
-            st.text_input("Telegram Bot Token", type="password", key="tg_tok_in")
-            st.text_input("Telegram Chat ID", key="tg_chat_in")
-        if st.button("📨 Test alert bhejo"):
-            ok, err = send_tg("✅ Vajra Analytics: test alert")
-            if ok:
-                st.success("Bhej diya, Telegram check karo.")
-            else:
-                st.error(err)
-        st.caption("Alert tabhi chalega jab app/tab khula ho aur Auto refresh on ho.")
-
-    # ---------- Quick reference (PDF) ----------
-    st.divider()
-    with st.expander("📘 LTP Calculator – Reversal Formula", expanded=False):
-        st.markdown(
-            """
-**Call side (EOR – Extension of Resistance)**
-`Reversal = Strike + Call Premium − (Time Decay / Greek buffer)`
-
-**Put side (EOS – Extension of Support)**
-`Reversal = Strike − Put Premium + (Time Decay / Greek buffer)`
-
----
-**3 Steps**
-1. **Upper (EOR):** Strike + Call LTP, phir 5–10% volatility/Greek buffer **minus**.
-2. **Lower (EOS):** Strike − Put LTP, phir 5–10% buffer **plus**.
-3. **Change:** Din beetne par theta se premium ghatta hai, to reversal level strike ke kareeb aata jata hai.
-
-**Factors**
-- **Delta:** `ΔPremium = Delta × ΔUnderlying`
-- **IV:** High IV → reversal strike se door (extension). Low IV → strike ke paas.
-- **Theoretical price:** jis level par option ka theoretical price zero/minimum chhuta hai.
-
-**Example (Nifty 24,000 PE, LTP ₹80)**
-- Break-even: 24,000 − 80 = **23,920**
-- Buffer ~₹12 → **EOS = 23,932**
-- Nifty girte hue 23,932 ke paas aaye to bounce (reversal) ke chances zyada.
-            """
-        )
-    pdf_path = Path(__file__).parent / "ltp_calculator_reversal_formula.pdf"
-    if pdf_path.exists():
-        st.download_button("⬇️ Full PDF kholo / download", pdf_path.read_bytes(),
-                           file_name=pdf_path.name, mime="application/pdf",
-                           width="stretch")
-
-if refresh_s != "Off":
-    if st_autorefresh:
-        st_autorefresh(interval=int(refresh_s.split()[0]) * 1000, key="auto_ref")
-    else:
-        st.sidebar.warning("streamlit-autorefresh install nahi hua (requirements.txt check karo).")
-
-T = THEMES[theme]
-ticker = {"NIFTY 50": "^NSEI", "BANKNIFTY": "^NSEBANK"}.get(preset, f"{custom}.NS")
-period = {"1m": "5d", "5m": "30d", "15m": "30d", "30m": "60d", "1h": "180d", "1d": "2y"}[interval]
-
-
-@st.cache_data(ttl=20, show_spinner="Data aa raha hai...")
-def load(tkr, period, interval, src="Free", ikey="", _token=""):
-    note = ""
-    if src == "Upstox" and ikey and _token:
-        try:
-            return up_candles(ikey, interval, _token), "Upstox", ""
-        except Exception as e:
-            note = f"Upstox candles nahi aaye ({e}). yfinance use ho raha hai."
-    df = yf.download(tkr, period=period, interval=interval, progress=False, auto_adjust=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df.dropna(), "yfinance", note
-
-
-def heikin_ashi(d):
-    ha = d.copy()
-    ha["Close"] = (d["Open"] + d["High"] + d["Low"] + d["Close"]) / 4
-    o = [(d["Open"].iloc[0] + d["Close"].iloc[0]) / 2]
-    for i in range(1, len(d)):
-        o.append((o[-1] + ha["Close"].iloc[i - 1]) / 2)
-    ha["Open"] = o
-    ha["High"] = pd.concat([d["High"], ha["Open"], ha["Close"]], axis=1).max(axis=1)
-    ha["Low"] = pd.concat([d["Low"], ha["Open"], ha["Close"]], axis=1).min(axis=1)
-    return ha
-
-
-def build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p):
-    rows = 2 if show_vol and "Volume" in df and df["Volume"].sum() > 0 else 1
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.02,
-                        row_heights=[0.8, 0.2] if rows == 2 else [1.0])
-    src = heikin_ashi(df) if chart_type == "Heikin Ashi" else df
-
-    if chart_type == "Line":
-        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines",
-                                 line=dict(color="#2962ff", width=2), name="Close"), row=1, col=1)
-    elif chart_type == "OHLC bars":
-        fig.add_trace(go.Ohlc(x=src.index, open=src["Open"], high=src["High"], low=src["Low"],
-                              close=src["Close"], increasing_line_color=UP,
-                              decreasing_line_color=DOWN, name="Price"), row=1, col=1)
-    else:
-        fig.add_trace(go.Candlestick(x=src.index, open=src["Open"], high=src["High"],
-                                     low=src["Low"], close=src["Close"],
-                                     increasing_line_color=UP, increasing_fillcolor=UP,
-                                     decreasing_line_color=DOWN, decreasing_fillcolor=DOWN,
-                                     name="Price"), row=1, col=1)
-
-    colors = {9: "#f9a825", 20: "#2962ff", 50: "#ab47bc", 200: "#e91e63"}
-    for n in ema_on:
-        e = full["Close"].ewm(span=n, adjust=False).mean().loc[df.index]
-        fig.add_trace(go.Scatter(x=df.index, y=e, mode="lines", name=f"EMA {n}",
-                                 line=dict(color=colors[n], width=1.3)), row=1, col=1)
-
-    if rows == 2:
-        vcol = np.where(df["Close"] >= df["Open"], UP, DOWN)
-        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=vcol, opacity=0.6,
-                             name="Volume", showlegend=False), row=2, col=1)
-
-    # ----- Zones + levels: traces (locked), so the eraser never deletes them -----
-    x0, x1 = df.index[0], df.index[-1]
-
-    def rgba(hex_, a):
-        h = hex_.lstrip("#")
-        return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{a})"
-
-    def band(lo, hi, col, label, pos="top"):
-        fig.add_trace(go.Scatter(x=[x0, x1, x1, x0, x0], y=[lo, lo, hi, hi, lo], mode="lines",
-                                 fill="toself", fillcolor=rgba(col, zone_op), line=dict(width=0),
-                                 hoverinfo="skip", showlegend=False, name=label), row=1, col=1)
-        ay, an = {"top": (hi, "top"), "above": (hi, "bottom"), "below": (lo, "top")}[pos]
-        fig.add_annotation(xref="x domain", yref="y", x=0.005, y=ay, xanchor="left",
-                           yanchor=an, showarrow=False, text=f"{label} {lo:,.0f}–{hi:,.0f}",
-                           font=dict(size=10, color=T["text"]))
-
-    def level(y, col, label, dash="dash", width=1):
-        fig.add_trace(go.Scatter(x=[x0, x1], y=[y, y], mode="lines", hoverinfo="skip",
-                                 line=dict(color=col, width=width, dash=dash),
-                                 showlegend=False, name=label), row=1, col=1)
-        fig.add_annotation(xref="x domain", yref="y", x=0.995, y=y, xanchor="right",
-                           yanchor="bottom", showarrow=False, text=label,
-                           font=dict(size=11, color=col))
-
-    if show_zones:
-        band(cip + w1c, cip + w2c, "#ef5350", "Supply 2", "above")
-        band(cip, cip + w1c, "#ff9800", "Supply 1")
-        band(pip - w1p, pip, "#26a69a", "Demand 1")
-        band(pip - w2p, pip - w1p, "#00897b", "Demand 2", "below")
-        level(cip, "#ff9800", "CIP")
-        level(pip, "#26a69a", "PIP")
-
-    for tok in extra.split(","):
-        try:
-            v = float(tok.strip())
-            level(v, "#ffeb3b", f"{v:,.0f}", dash="dot")
-        except ValueError:
-            pass
-
-    ltp, prev = float(df["Close"].iloc[-1]), float(df["Open"].iloc[-1])
-    if show_last:
-        lc = UP if ltp >= prev else DOWN
-        fig.add_trace(go.Scatter(x=[x0, x1], y=[ltp, ltp], mode="lines", hoverinfo="skip",
-                                 line=dict(color=lc, width=1, dash="dot"), showlegend=False),
-                      row=1, col=1)
-        fig.add_annotation(xref="x domain", yref="y", x=1, y=ltp, xanchor="right",
-                           showarrow=False, text=f"{ltp:,.2f}", bgcolor=lc,
-                           font=dict(size=11, color="white"))
-
-    # ----- Y range: price + zones so everything is visible -----
-    lo_y, hi_y = df["Low"].min(), df["High"].max()
-    if show_zones:
-        lo_y, hi_y = min(lo_y, pip - w2p), max(hi_y, cip + w2c)
-    pad = (hi_y - lo_y) * 0.04
-
-    fig.update_layout(
-        template=T["tmpl"], paper_bgcolor=T["bg"], plot_bgcolor=T["bg"],
-        font=dict(color=T["text"]), height=height, margin=dict(l=8, r=8, t=30, b=8),
-        dragmode="pan", hovermode="x unified", xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", y=1.02, x=0), uirevision=f"{ticker}-{interval}-{st.session_state.clear_n}",
-        newshape=dict(line_color=draw_col, line_width=draw_w),
+st.set_page_config(page_title="Liquidity Scanner", layout="wide")
+
+
+# ---------------------------------------------------------------- scanner logic
+def swing_points(df, left=3, right=3):
+    highs, lows = df["high"].values, df["low"].values
+    n = len(df)
+    sh, sl = np.zeros(n, bool), np.zeros(n, bool)
+    for i in range(left, n - right):
+        if highs[i] == highs[i - left : i + right + 1].max():
+            sh[i] = True
+        if lows[i] == lows[i - left : i + right + 1].min():
+            sl[i] = True
+    out = df.copy()
+    out["swing_high"], out["swing_low"] = sh, sl
+    return out
+
+
+def _cluster(levels, tol_pct):
+    levels = sorted(levels)
+    clusters, cur = [], []
+    for lv in levels:
+        if cur and (lv - np.mean(cur)) / np.mean(cur) * 100 > tol_pct:
+            clusters.append(cur)
+            cur = []
+        cur.append(lv)
+    if cur:
+        clusters.append(cur)
+    return [c for c in clusters if len(c) >= 2]
+
+
+def liquidity_zones(df, tol_pct=0.1):
+    sw = swing_points(df)
+    eqh = _cluster(sw.loc[sw.swing_high, "high"].tolist(), tol_pct)
+    eql = _cluster(sw.loc[sw.swing_low, "low"].tolist(), tol_pct)
+    return (
+        [{"level": round(float(np.mean(c)), 2), "touches": len(c)} for c in eqh],
+        [{"level": round(float(np.mean(c)), 2), "touches": len(c)} for c in eql],
     )
-    breaks = [dict(bounds=["sat", "mon"])]
-    if interval != "1d":
-        breaks.append(dict(bounds=[15.5, 9.25], pattern="hour"))   # NSE hours (IST)
-    fig.update_xaxes(showgrid=True, gridcolor=T["grid"], rangebreaks=breaks, showspikes=True,
-                     spikemode="across", spikesnap="cursor", spikethickness=1,
-                     spikedash="dot", spikecolor="#9598a1")
-    fig.update_yaxes(showgrid=True, gridcolor=T["grid"], side="right", showspikes=True,
-                     spikemode="across", spikethickness=1, spikedash="dot", spikecolor="#9598a1")
-    fmt = ".0f" if hi_y >= 1000 else ".2f"
-    fig.update_yaxes(range=[lo_y - pad, hi_y + pad], tickformat=fmt, hoverformat=",.2f",
-                     exponentformat="none", separatethousands=False, fixedrange=True,
-                     row=1, col=1)
-    return fig
 
 
-if refresh:
-    st.cache_data.clear()
+def detect_sweeps(df, lookback=20):
+    rows = []
+    for i in range(lookback, len(df)):
+        prev = df.iloc[i - lookback : i]
+        c = df.iloc[i]
+        ph, pl = prev["high"].max(), prev["low"].min()
+        if c["high"] > ph and c["close"] < ph:
+            rows.append({"time": c["time"], "type": "BEARISH_SWEEP", "level": ph, "price": c["high"]})
+        elif c["low"] < pl and c["close"] > pl:
+            rows.append({"time": c["time"], "type": "BULLISH_SWEEP", "level": pl, "price": c["low"]})
+    return pd.DataFrame(rows)
 
-full, used, note = load(ticker, period, interval, src, UP_KEYS.get(preset, ""), up_token())
-if note:
-    st.warning(note)
-if full.empty:
-    st.error(f"'{ticker}' ka data nahi mila. Symbol ya timeframe check karo.")
-    st.stop()
-df = full.tail(bars)
 
-if pip >= cip:
-    st.warning("Normally PIP, CIP se neeche hota hai. Values check kar lo.")
+# ---------------------------------------------------------------- data loaders
+def demo_data(n=300):
+    rng = np.random.default_rng(7)
+    close = 100 + np.cumsum(rng.normal(0, 0.4, n))
+    return pd.DataFrame({
+        "time": pd.date_range("2026-01-01", periods=n, freq="15min"),
+        "open": close + rng.normal(0, 0.1, n),
+        "high": close + abs(rng.normal(0.3, 0.2, n)),
+        "low": close - abs(rng.normal(0.3, 0.2, n)),
+        "close": close,
+        "volume": rng.integers(100, 1000, n),
+    })
 
-# ---------- Header strip ----------
-ltp = float(df["Close"].iloc[-1])
-chg = ltp - float(full["Close"].iloc[-2]) if len(full) > 1 else 0.0
-st.subheader(f"{ticker}  ·  {interval}  ·  {used}")
-h2, h3, h4 = st.columns(3)
-h2.metric("LTP", f"{ltp:,.2f}", f"{chg:+,.2f}")
-h3.metric("To CIP", f"{cip - ltp:,.1f}")
-h4.metric("To PIP", f"{ltp - pip:,.1f}")
 
-if alert_on:
-    sent, errs = check_alerts(preset if not stock_mode else custom, ltp,
-                              {"CIP": cip, "PIP": pip},
-                              alert_pts, cooldown, only_mkt)
-    for n_ in sent:
-        st.toast(f"🔔 Alert bheja: {n_}")
-    if errs:
-        st.warning(errs[0])
-    elif only_mkt and not market_open():
-        st.caption("🔔 Alerts ON · market band hai, isliye abhi nahi bhej raha.")
+@st.cache_data(ttl=60)
+def delta_candles(symbol, resolution, count):
+    """Delta Exchange India public candles API (API key ki zaroorat nahi)."""
+    secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}[resolution]
+    end = int(time.time())
+    start = end - secs * count
+    r = requests.get(
+        "https://api.india.delta.exchange/v2/history/candles",
+        params={"symbol": symbol, "resolution": resolution, "start": start, "end": end},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json().get("result", [])
+    if not data:
+        raise ValueError("Koi candle data nahi mila. Symbol check karein.")
+    df = pd.DataFrame(data)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    return df.sort_values("time").reset_index(drop=True)[["time", "open", "high", "low", "close", "volume"]]
+
+
+def load_csv(file):
+    df = pd.read_csv(file)
+    df.columns = [c.strip().lower() for c in df.columns]
+    need = {"time", "open", "high", "low", "close"}
+    if not need.issubset(df.columns):
+        raise ValueError(f"CSV mein ye columns chahiye: {sorted(need)} (volume optional)")
+    if "volume" not in df.columns:
+        df["volume"] = 0
+    df["time"] = pd.to_datetime(df["time"])
+    return df.sort_values("time").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- UI
+st.title("Liquidity Scanner")
+st.caption("Equal highs/lows aur liquidity sweeps. Ye research tool hai, trade signal nahi.")
+
+with st.sidebar:
+    st.header("Data")
+    source = st.radio("Source", ["Demo", "CSV upload", "Delta Exchange India"])
+    tol = st.slider("Equal level tolerance (%)", 0.02, 0.5, 0.10, 0.01)
+    lookback = st.slider("Sweep lookback (candles)", 5, 60, 20)
+
+df, err = None, None
+try:
+    if source == "Demo":
+        df = demo_data()
+    elif source == "CSV upload":
+        f = st.sidebar.file_uploader("OHLCV CSV", type="csv")
+        if f:
+            df = load_csv(f)
     else:
-        st.caption(f"🔔 Alerts ON · CIP/PIP ke {alert_pts:g} pts paas aane par.")
+        sym = st.sidebar.text_input("Symbol", "BTCUSD")
+        res = st.sidebar.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=2)
+        cnt = st.sidebar.slider("Candles", 100, 500, 300)
+        df = delta_candles(sym, res, cnt)
+except Exception as e:
+    err = str(e)
 
-fig = build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p)
-
-config = {
-    "scrollZoom": False,
-    "displaylogo": False,
-    "doubleClick": "reset+autosize",
-    "edits": {"shapePosition": True},   # drawn shapes ko drag/resize kar sakte ho
-    "displayModeBar": True,
-    "modeBarButtonsToAdd": ["drawline", "drawopenpath", "drawrect", "eraseshape"],
-    "modeBarButtonsToRemove": ["lasso2d", "select2d", "zoom2d", "zoomIn2d", "zoomOut2d", "autoScale2d"],
-    "toImageButtonOptions": {"format": "png", "filename": "vajra_chart", "scale": 2},
-}
-st.plotly_chart(fig, width="stretch", config=config)
-
-st.caption(
-    "🖱️ Drag = pan · Double-click = reset · "
-    "✏️ Draw: toolbar se line/rect chuno · Delete: shape par click karke select karo, phir toolbar ka "
-    "🗑 eraser dabao · Sab hatane ke liye sidebar ka 'Clear all drawings' · "
-    "⛶ Fullscreen: chart par hover karke upar-right ka icon."
-)
-
-# ---------------- Option chain table ----------------
-st.divider()
-st.subheader("📋 Option Chain")
-ch = st.session_state.get("chain")
-if not ch:
-    st.info("Sidebar mein 'se CIP/PIP lao' button dabao, option chain yahan dikhega.")
+if err:
+    st.error(err)
+elif df is None:
+    st.info("CSV upload karein ya sidebar se koi aur source chunein.")
 else:
-    exp = st.session_state.get("exp_sel") or ch["expiries"][0]
-    if ch.get("source") == "Upstox":      # live refresh (15 sec cache)
-        try:
-            nd, sp = up_chain_cached(ch["ikey"], exp, up_token())
-            if not nd.empty:
-                ch["df"] = pd.concat([ch["df"][ch["df"]["Expiry"] != exp], nd], ignore_index=True)
-                ch["underlying"] = sp or ch.get("underlying")
-        except Exception as e:
-            st.caption(f"Chain refresh nahi hua: {e}")
-    d_ch = ch["df"][ch["df"]["Expiry"] == exp]
-    if d_ch.empty:
-        st.warning("Is expiry ka data nahi mila.")
+    buy_side, sell_side = liquidity_zones(df, tol)
+    sweeps = detect_sweeps(df, lookback)
+    last = float(df["close"].iloc[-1])
+
+    fig = go.Figure(go.Candlestick(
+        x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Price"))
+    for z in buy_side:
+        fig.add_hline(y=z["level"], line_dash="dot", line_color="#d9534f",
+                      annotation_text=f"EQH x{z['touches']}", annotation_position="right")
+    for z in sell_side:
+        fig.add_hline(y=z["level"], line_dash="dot", line_color="#2e9e5b",
+                      annotation_text=f"EQL x{z['touches']}", annotation_position="right")
+    if len(sweeps):
+        for kind, color, sym_ in [("BEARISH_SWEEP", "#d9534f", "triangle-down"),
+                                  ("BULLISH_SWEEP", "#2e9e5b", "triangle-up")]:
+            s = sweeps[sweeps["type"] == kind]
+            fig.add_trace(go.Scatter(x=s["time"], y=s["price"], mode="markers", name=kind,
+                                     marker=dict(symbol=sym_, size=10, color=color)))
+    fig.update_layout(height=600, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Last price", f"{last:,.2f}")
+    c2.metric("Buy-side zones (EQH)", len(buy_side))
+    c3.metric("Sell-side zones (EQL)", len(sell_side))
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Upar ki liquidity (EQH)")
+        t = pd.DataFrame(buy_side)
+        if len(t):
+            t["distance_%"] = ((t["level"] - last) / last * 100).round(2)
+            st.dataframe(t.sort_values("distance_%", key=abs), hide_index=True, use_container_width=True)
+        else:
+            st.write("Koi zone nahi mila.")
+    with right:
+        st.subheader("Neeche ki liquidity (EQL)")
+        t = pd.DataFrame(sell_side)
+        if len(t):
+            t["distance_%"] = ((t["level"] - last) / last * 100).round(2)
+            st.dataframe(t.sort_values("distance_%", key=abs), hide_index=True, use_container_width=True)
+        else:
+            st.write("Koi zone nahi mila.")
+
+    st.subheader("Haal ke sweeps")
+    if len(sweeps):
+        st.dataframe(sweeps.tail(10).iloc[::-1], hide_index=True, use_container_width=True)
     else:
-        spot = float(ch.get("underlying") or ltp)
-        n_str = st.slider("ATM ke upar/neeche kitne strikes", 3, 25, 10)
-        show_gk = st.checkbox("Greeks (Δ delta, Θ theta) dikhao", False)
-        scale_all = st.checkbox("% poore chain (saare strikes) ke sabse bade ke hisab se", False)
-        tc, tp = float(d_ch["CE_OI"].sum()), float(d_ch["PE_OI"].sum())
-        d_s = d_ch.sort_values("Strike")
-        a_row = d_s.iloc[int((d_s["Strike"] - spot).abs().values.argmin())]
-        synth = float(a_row["Strike"]) + float(a_row["CE_LTP"]) - float(a_row["PE_LTP"])
-        mcs = d_s.loc[d_s["CE_OI"].idxmax(), "Strike"]
-        mps = d_s.loc[d_s["PE_OI"].idxmax(), "Strike"]
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Spot", f"{spot:,.2f}")
-        m2.metric("Synth Fut", f"{synth:,.2f}")
-        m3.metric("PCR (OI)", f"{tp / max(tc, 1):.2f}")
-        m4, m5, m6 = st.columns(3)
-        m4.metric("Max Call OI", f"{mcs:,.0f}")
-        m5.metric("Max Put OI", f"{mps:,.0f}")
-        m6.metric("Call / Put OI", f"{tc / 1e5:,.0f}L / {tp / 1e5:,.0f}L")
-        st.markdown(chain_html(d_ch, spot, cip, pip, n_str, show_gk, scale_all), unsafe_allow_html=True)
-        st.caption(f"Expiry {exp} · Spot {spot:,.2f} · Peeli line = Spot (market abhi yahan) · Neela strike = ATM · peela = ITM · "
-                   "🔴CIP / 🟢PIP = aapke levels · OI lakh mein, Volume K mein · % = " + ("poore chain" if scale_all else "visible strikes") + " mein sabse bade ke muqable.")
+        st.write("Koi sweep nahi mila.")
 
-st.divider()
-st.subheader("📌 Zones")
-zdf = pd.DataFrame([["Supply 2", cip + w1c, cip + w2c], ["Supply 1", cip, cip + w1c],
-                    ["Demand 1", pip - w1p, pip], ["Demand 2", pip - w2p, pip - w1p]],
-                   columns=["Zone", "From", "To"])
-st.dataframe(zdf.style.format({"From": "{:,.2f}", "To": "{:,.2f}"}), hide_index=True,
-             width="stretch")
-
-with st.expander("🛡️ Support-bounce risk plan (sirf educational)"):
-    sl_pts = st.slider("Stop loss (points)", 10, 50, 30, 5)
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("Entry (PIP)", f"{pip:,.1f}")
-    r2.metric("Stop loss", f"{pip - sl_pts:,.1f}")
-    r3.metric("Target 1 (1:1.5)", f"{pip + sl_pts * 1.5:,.1f}")
-    r4.metric("Target 2 (1:2)", f"{pip + sl_pts * 2:,.1f}")
-    st.caption("Ye sirf ek fixed formula hai, trade signal ya advice nahi.")
-
-st.divider()
-if ltp > cip + w2c:
-    st.error("🚀 Price Supply 2 ke upar — strong breakout")
-elif ltp > cip:
-    st.warning("📈 Price Supply zone ke andar — resistance area")
-elif ltp < pip - w2p:
-    st.error("🔻 Price Demand 2 ke neeche — strong breakdown")
-elif ltp < pip:
-    st.success("📉 Price Demand zone ke andar — support area")
-else:
-    st.info("↔️ Price PIP aur CIP ke beech (range-bound)")
-st.caption("Sirf educational use ke liye. Ye financial advice nahi hai.")
+st.caption("Disclaimer: Ye financial salah nahi hai. Liquidity levels sirf sambhavit jagah batate hain.")
