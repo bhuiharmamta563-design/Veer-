@@ -379,9 +379,42 @@ def apply_levels():
     pr = st.session_state.get("preset", "NIFTY 50")
     st.session_state[f"cip_{pr}"] = float(c["Strike"])
     st.session_state[f"pip_{pr}"] = float(p["Strike"])
-    st.session_state[f"cs_{pr}"], st.session_state[f"cl_{pr}"] = float(c["Strike"]), float(c["CE_LTP"])
-    st.session_state[f"ps_{pr}"], st.session_state[f"pl_{pr}"] = float(p["Strike"]), float(p["PE_LTP"])
     st.session_state["lvl_info"] = f"{ch['symbol']} · {exp} · {st.session_state.get('basis', 'Max OI')}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def up_expiries_cached(ikey, _token):
+    return up_expiries(ikey, _token)
+
+
+def auto_levels():
+    """Har run par option chain laakar CIP/PIP (aur zones) apne aap update karta hai."""
+    tok, p = up_token(), st.session_state.get("preset", "NIFTY 50")
+    if not tok or p not in UP_KEYS:
+        return
+    ik = UP_KEYS[p]
+    try:
+        exps = up_expiries_cached(ik, tok)
+        if not exps:
+            raise RuntimeError("Expiry list khali aayi.")
+        ch = st.session_state.get("chain")
+        exp = st.session_state.get("exp_sel")
+        if exp not in exps:
+            exp = exps[0]
+            st.session_state["exp_sel"] = exp
+        df, spot = up_chain_cached(ik, exp, tok)
+        if df.empty:
+            raise RuntimeError("Option chain khali aayi.")
+        if not ch or ch.get("ikey") != ik or ch.get("source") != "Upstox":
+            ch = dict(df=df, expiries=exps, underlying=spot, symbol=p, source="Upstox", ikey=ik)
+        else:
+            ch["df"] = pd.concat([ch["df"][ch["df"]["Expiry"] != exp], df], ignore_index=True)
+            ch["underlying"], ch["expiries"] = spot, exps
+        st.session_state["chain"] = ch
+        apply_levels()
+        st.session_state["nse_msg"] = ("success", f"Auto-update ON · Spot {spot}")
+    except Exception as e:
+        st.session_state["nse_msg"] = ("error", f"Auto levels nahi aaye: {e}")
 
 
 def on_fetch():
@@ -428,6 +461,10 @@ with st.sidebar:
 
     st.subheader("Option chain levels")
     st.button(f"📡 {'Upstox' if src == 'Upstox' else 'NSE'} se CIP/PIP lao", on_click=on_fetch, type="primary", width="stretch")
+    auto_lv = st.checkbox("🔄 CIP/PIP auto-update (option chain se, har refresh par)", value=True,
+                          key="auto_lv", disabled=(src != "Upstox" or stock_mode))
+    if auto_lv and src == "Upstox" and not stock_mode and up_token():
+        auto_levels()
     st.selectbox("CIP/PIP kis basis par", list(BASIS), key="basis", on_change=apply_levels)
     if st.session_state.get("chain"):
         st.selectbox("Expiry", st.session_state["chain"]["expiries"], key="exp_sel", on_change=apply_levels)
@@ -476,31 +513,6 @@ with st.sidebar:
     if st.button("🗑️ Clear all drawings", width="stretch"):
         st.session_state.clear_n += 1
     refresh = st.button("🔄 Refresh data", width="stretch")
-
-    # ---------- Reversal calculator inputs ----------
-    with st.expander("🧮 Reversal Calculator (EOS / EOR)", expanded=True):
-        st.caption("Result chart ke neeche dikhega aur chart par lines bhi banengi.")
-        for k, v in ((f"cs_{preset}", float(cip)), (f"cl_{preset}", 80.0),
-                     (f"ps_{preset}", float(pip)), (f"pl_{preset}", 80.0)):
-            st.session_state.setdefault(k, v)
-        cs = st.number_input("Call strike", step=5.0, key=f"cs_{preset}")
-        cltp = st.number_input("Call LTP (premium)", step=0.5, min_value=0.0, key=f"cl_{preset}")
-        ps = st.number_input("Put strike", step=5.0, key=f"ps_{preset}")
-        pltp = st.number_input("Put LTP (premium)", step=0.5, min_value=0.0, key=f"pl_{preset}")
-        buf_mode = st.radio("Buffer (Greek / IV / theta)", ["% of premium", "Manual points"], horizontal=True)
-        if buf_mode == "% of premium":
-            buf_pct = st.slider("Buffer %", 0.0, 20.0, 10.0, 0.5)
-            buf_c, buf_p = cltp * buf_pct / 100, pltp * buf_pct / 100
-        else:
-            buf_c = st.number_input("Call buffer (points)", value=12.0, step=1.0, min_value=0.0)
-            buf_p = st.number_input("Put buffer (points)", value=12.0, step=1.0, min_value=0.0)
-            buf_pct = None
-        show_rev = st.checkbox("Chart par EOS / EOR lines dikhao", True)
-        show_be = st.checkbox("Break-even lines bhi dikhao", False)
-
-    call_be, put_be = cs + cltp, ps - pltp
-    eor = call_be - buf_c        # Upper reversal
-    eos = put_be + buf_p         # Lower reversal
 
     # ---------- Alerts + auto refresh ----------
     with st.expander("🔔 Alerts (Telegram) + Auto refresh", expanded=False):
@@ -656,13 +668,6 @@ def build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p):
         level(cip, "#ff9800", "CIP")
         level(pip, "#26a69a", "PIP")
 
-    if show_rev:
-        level(eor, "#e040fb", f"EOR {eor:,.1f}", dash="dashdot", width=1.5)
-        level(eos, "#00e5ff", f"EOS {eos:,.1f}", dash="dashdot", width=1.5)
-        if show_be:
-            level(call_be, "#e040fb", f"Call B/E {call_be:,.0f}", dash="dot")
-            level(put_be, "#00e5ff", f"Put B/E {put_be:,.0f}", dash="dot")
-
     for tok in extra.split(","):
         try:
             v = float(tok.strip())
@@ -684,10 +689,6 @@ def build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p):
     lo_y, hi_y = df["Low"].min(), df["High"].max()
     if show_zones:
         lo_y, hi_y = min(lo_y, pip - w2p), max(hi_y, cip + w2c)
-    if show_rev:
-        lo_y, hi_y = min(lo_y, eos), max(hi_y, eor)
-        if show_be:
-            lo_y, hi_y = min(lo_y, put_be), max(hi_y, call_be)
     pad = (hi_y - lo_y) * 0.04
 
     fig.update_layout(
@@ -737,7 +738,7 @@ h4.metric("To PIP", f"{ltp - pip:,.1f}")
 
 if alert_on:
     sent, errs = check_alerts(preset if not stock_mode else custom, ltp,
-                              {"CIP": cip, "PIP": pip, "EOR": eor, "EOS": eos},
+                              {"CIP": cip, "PIP": pip},
                               alert_pts, cooldown, only_mkt)
     for n_ in sent:
         st.toast(f"🔔 Alert bheja: {n_}")
@@ -746,7 +747,7 @@ if alert_on:
     elif only_mkt and not market_open():
         st.caption("🔔 Alerts ON · market band hai, isliye abhi nahi bhej raha.")
     else:
-        st.caption(f"🔔 Alerts ON · CIP/PIP/EOR/EOS ke {alert_pts:g} pts paas aane par.")
+        st.caption(f"🔔 Alerts ON · CIP/PIP ke {alert_pts:g} pts paas aane par.")
 
 fig = build_fig(df, full, cip, pip, w1c, w2c, w1p, w2p)
 
@@ -810,56 +811,6 @@ else:
         st.markdown(chain_html(d_ch, spot, cip, pip, n_str, show_gk, scale_all), unsafe_allow_html=True)
         st.caption(f"Expiry {exp} · Spot {spot:,.2f} · Peeli line = Spot (market abhi yahan) · Neela strike = ATM · peela = ITM · "
                    "🔴CIP / 🟢PIP = aapke levels · OI lakh mein, Volume K mein · % = " + ("poore chain" if scale_all else "visible strikes") + " mein sabse bade ke muqable.")
-
-# ---------------- Reversal calculator results ----------------
-st.divider()
-st.subheader("🧮 Reversal Calculator – step by step")
-bt = f"{buf_pct:g}% of premium" if buf_pct is not None else "manual points"
-cA, cB = st.columns(2)
-with cA:
-    st.markdown("#### 🔴 Upper Reversal (EOR) – Call side")
-    st.write(f"1. Strike + Call LTP = {cs:,.0f} + {cltp:,.2f} = **{call_be:,.2f}**")
-    st.write(f"2. Buffer ({bt}) = **{buf_c:,.2f}**")
-    st.write(f"3. EOR = {call_be:,.2f} − {buf_c:,.2f} = **{eor:,.2f}**")
-    st.metric("EOR", f"{eor:,.2f}", f"{eor - ltp:+,.1f} from LTP", delta_color="off")
-with cB:
-    st.markdown("#### 🟢 Lower Reversal (EOS) – Put side")
-    st.write(f"1. Strike − Put LTP = {ps:,.0f} − {pltp:,.2f} = **{put_be:,.2f}**")
-    st.write(f"2. Buffer ({bt}) = **{buf_p:,.2f}**")
-    st.write(f"3. EOS = {put_be:,.2f} + {buf_p:,.2f} = **{eos:,.2f}**")
-    st.metric("EOS", f"{eos:,.2f}", f"{eos - ltp:+,.1f} from LTP", delta_color="off")
-
-summary = pd.DataFrame({
-    "Level": ["EOR", "Call break-even", "LTP", "Put break-even", "EOS"],
-    "Price": [eor, call_be, ltp, put_be, eos],
-})
-summary["LTP se distance"] = summary["Price"] - ltp
-summary["LTP se %"] = summary["LTP se distance"] / ltp * 100
-summary = summary.sort_values("Price", ascending=False)
-st.dataframe(summary.style.format({"Price": "{:,.2f}", "LTP se distance": "{:+,.1f}", "LTP se %": "{:+.2f}%"}),
-             hide_index=True, width="stretch")
-
-near = min([("EOR", eor), ("EOS", eos)], key=lambda t: abs(ltp - t[1]))
-tol = max(ltp * 0.0015, 1)
-if abs(ltp - near[1]) <= tol:
-    side = "resistance se reversal (neeche) ke chances" if near[0] == "EOR" else "support se bounce ke chances"
-    st.success(f"🎯 LTP {near[0]} ({near[1]:,.1f}) ke paas hai → {side} zyada.")
-else:
-    st.info(f"Nearest reversal: **{near[0]} {near[1]:,.1f}** (LTP se {abs(ltp - near[1]):,.1f} points door)")
-
-st.markdown("**Time-decay effect (Change of Reversal):** premium ghatne par EOR/EOS strike ke kareeb aate hain")
-decay = []
-for keep in (100, 75, 50, 25, 10):
-    f = keep / 100
-    decay.append({
-        "Premium bacha": f"{keep}%",
-        "Call LTP": cltp * f, "EOR": cs + cltp * f - buf_c * f,
-        "Put LTP": pltp * f, "EOS": ps - pltp * f + buf_p * f,
-    })
-st.dataframe(pd.DataFrame(decay).style.format({c: "{:,.2f}" for c in ["Call LTP", "EOR", "Put LTP", "EOS"]}),
-             hide_index=True, width="stretch")
-st.caption("Buffer PDF ke hisab se 5–10% Greek/IV buffer hai; PDF ke example mein ~₹12 liya gaya tha, "
-           "isliye 'Manual points' ka option bhi diya hai. IV zyada ho to buffer badhao.")
 
 st.divider()
 st.subheader("📌 Zones")
