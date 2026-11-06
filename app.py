@@ -20,11 +20,6 @@ if not ACCESS_TOKEN:
     st.error("UPSTOX_ACCESS_TOKEN Streamlit Secrets me nahi mila. Naya token generate karke daalein.")
     st.stop()
 
-BASE_HEADERS = {
-    "Accept": "application/json",
-    "Authorization": f"Bearer {ACCESS_TOKEN}",
-}
-
 # ----------------------------------------------------
 # Index selector
 # ----------------------------------------------------
@@ -42,7 +37,6 @@ INSTRUMENT_KEY = instrument_mapping[symbol_choice]
 # ----------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_expiries(inst_key, token):
-    """Valid expiry dates seedha Upstox se."""
     try:
         r = requests.get(
             "https://api.upstox.com/v2/option/contract",
@@ -156,7 +150,6 @@ if df.empty:
 
 df = df.sort_values(by="Strike").reset_index(drop=True)
 
-# Spot nahi mila to strikes ka beech wala use karo
 if not underlying_price:
     underlying_price = float(df["Strike"].median())
 
@@ -174,7 +167,6 @@ oi_demand_zones = df.nlargest(2, "P_OI")["Strike"].tolist()
 vol_supply_zones = df.nlargest(2, "C_Vol")["Strike"].tolist()
 vol_demand_zones = df.nlargest(2, "P_Vol")["Strike"].tolist()
 
-# Reversal level: jahan Put OI aur Call OI sabse kareeb hain
 reversal_price = int(df.loc[(df["P_OI"] - df["C_OI"]).abs().idxmin(), "Strike"])
 
 
